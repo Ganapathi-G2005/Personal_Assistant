@@ -1,0 +1,13 @@
+# Langchain and related packages
+langchain
+langchain-openai
+langchain-community
+langgraph
+pydantic
+gradio
+python-dotenv
+nest_asyncio
+playwright
+ipython
+beautifulsoup4
+tavily-python
