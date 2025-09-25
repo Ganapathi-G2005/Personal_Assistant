@@ -240,12 +240,13 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- 📧 Email: [your-email@example.com]
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/sidekick/issues)
-- 💬 Discussions: [GitHub Discussions](https://github.com/yourusername/sidekick/discussions)
+- 📧 Email: ganapathi.cpp@gmail.com
+- 🐛 Issues: [GitHub Issues](https://github.com/Ganapathi-G2005/sidekick/issues)
+- 💬 Discussions: [GitHub Discussions](https://github.com/Ganapathi-G2005/sidekick/discussions)
 
 ---
 
 Made with ❤️ by [Your Name]
+
 
 
