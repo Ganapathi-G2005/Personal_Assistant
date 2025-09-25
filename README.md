@@ -238,15 +238,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Vercel](https://vercel.com/) for serverless deployment
 - [FastAPI](https://fastapi.tiangolo.com/) for the API framework
 
-## 📞 Support
 
-- 📧 Email: ganapathi.cpp@gmail.com
-- 🐛 Issues: [GitHub Issues](https://github.com/Ganapathi-G2005/sidekick/issues)
-- 💬 Discussions: [GitHub Discussions](https://github.com/Ganapathi-G2005/sidekick/discussions)
+Made with ❤️ by GMS Ganapathi.
 
----
-
-Made with ❤️ by [Your Name]
 
 
 
