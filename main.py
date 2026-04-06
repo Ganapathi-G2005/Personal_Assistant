@@ -55,6 +55,7 @@ class State(TypedDict):
     feedback_on_work: NotRequired[Optional[str]]
     success_criteria_met: bool
     user_input_needed: bool
+    retry_count: NotRequired[int]
 
 
 # ─────────────────────────────── Tools Setup ─────────────────────────────────
@@ -85,6 +86,75 @@ evaluator_llm_with_output = evaluator_llm.with_structured_output(EvaluatorOutput
 
 # ─────────────────────────────── Graph Nodes ─────────────────────────────────
 
+def sanitize_tool_call_history(messages: List[Any]) -> List[Any]:
+    """
+    Remove assistant tool-call turns that are missing tool responses.
+    This prevents OpenAI 400 errors for invalid tool-call sequencing.
+    """
+    sanitized: List[Any] = []
+    i = 0
+
+    def _role(msg: Any) -> str:
+        if isinstance(msg, dict):
+            role = msg.get("role", msg.get("type", ""))
+            if role == "ai":
+                return "assistant"
+            if role == "human":
+                return "user"
+            return role
+        m_type = getattr(msg, "type", "")
+        if m_type == "ai":
+            return "assistant"
+        if m_type == "human":
+            return "user"
+        return m_type
+
+    def _tool_calls(msg: Any) -> List[Dict[str, Any]]:
+        if isinstance(msg, dict):
+            return msg.get("tool_calls", []) or []
+        return getattr(msg, "tool_calls", []) or []
+
+    def _tool_call_id(msg: Any) -> str:
+        if isinstance(msg, dict):
+            return msg.get("tool_call_id", "") or ""
+        return getattr(msg, "tool_call_id", "") or ""
+
+    while i < len(messages):
+        msg = messages[i]
+        if _role(msg) != "assistant":
+            sanitized.append(msg)
+            i += 1
+            continue
+
+        calls = _tool_calls(msg)
+        if not calls:
+            sanitized.append(msg)
+            i += 1
+            continue
+
+        required_ids = {c.get("id") for c in calls if isinstance(c, dict) and c.get("id")}
+        j = i + 1
+        seen_ids = set()
+        tool_msgs: List[Any] = []
+
+        while j < len(messages) and _role(messages[j]) == "tool":
+            tool_msg = messages[j]
+            t_id = _tool_call_id(tool_msg)
+            if t_id:
+                seen_ids.add(t_id)
+            tool_msgs.append(tool_msg)
+            j += 1
+
+        if required_ids and required_ids.issubset(seen_ids):
+            sanitized.append(msg)
+            sanitized.extend(tool_msgs)
+        else:
+            print("--> [WARN] Dropped dangling tool_call assistant message from state history.")
+
+        i = j
+
+    return sanitized
+
 async def worker(state: State) -> Dict[str, Any]:
     print(f"--> [DEBUG] Entered worker() node. Messages count: {len(state.get('messages', []))}")
     system_message = f"""You are a helpful assistant that can use tools to complete tasks.
@@ -106,7 +176,7 @@ Here is the feedback on why this was rejected:
 With this feedback, please continue the assignment, ensuring that you meet the success criteria or have a question for the user."""
 
     found_system_message = False
-    messages = state["messages"]
+    messages = sanitize_tool_call_history(state["messages"])
     for message in messages:
         # LangGraph message format adaptation handling both objects and dicts
         is_sys = getattr(message, "type", "") == "system" or (isinstance(message, dict) and message.get("type") == "system")
@@ -182,16 +252,21 @@ Also, decide if more user input is required.
     print("--> [DEBUG] Calling evaluator_llm_with_output.ainvoke()...")
     eval_result = await evaluator_llm_with_output.ainvoke(evaluator_messages)
     print(f"--> [DEBUG] evaluator_llm_with_output.ainvoke() completed: feedback={eval_result.feedback}, met={eval_result.success_criteria_met}")
+    current_retry = int(state.get("retry_count", 0))
 
     return {
         "messages": [{"role": "assistant", "content": f"Evaluator Feedback: {eval_result.feedback}"}],
         "feedback_on_work": eval_result.feedback,
         "success_criteria_met": eval_result.success_criteria_met,
         "user_input_needed": eval_result.user_input_needed,
+        "retry_count": current_retry + 1,
     }
 
 
 async def route_based_on_evaluation(state: State) -> str:
+    max_retries = 10
+    if state.get("retry_count", 0) >= max_retries:
+        return "END"
     if state["success_criteria_met"] or state["user_input_needed"]:
         return "END"
     return "worker"
@@ -296,6 +371,7 @@ async def chat_stream(request: ChatRequest):
                     "feedback_on_work": None,
                     "success_criteria_met": False,
                     "user_input_needed": False,
+                    "retry_count": 0,
                 }
             else:
                 invoke_input = {
