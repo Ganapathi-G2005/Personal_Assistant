@@ -4,10 +4,13 @@ langchain-openai
 langchain-community
 langgraph
 pydantic
-gradio
 python-dotenv
 nest_asyncio
 playwright
-ipython
 beautifulsoup4
 tavily-python
+# Web server
+fastapi
+uvicorn[standard]
+sse-starlette
+aiofiles

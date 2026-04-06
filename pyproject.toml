@@ -5,8 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiofiles>=24.1.0",
     "beautifulsoup4>=4.13.5",
-    "gradio>=5.44.1",
+    "fastapi[standard]>=0.115.0",
     "ipython>=9.5.0",
     "langchain>=0.3.27",
     "langchain-community>=0.3.29",
@@ -16,5 +17,6 @@ dependencies = [
     "playwright>=1.55.0",
     "pydantic>=2.11.7",
     "python-dotenv>=1.1.1",
+    "sse-starlette>=2.1.0",
     "tavily-python>=0.7.11",
 ]
