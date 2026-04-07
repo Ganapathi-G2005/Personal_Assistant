@@ -1,10 +1,9 @@
-
 # Sidekick - Personal AI Assistant
 
 [![CI](https://github.com/yourusername/sidekick/workflows/CI/badge.svg)](https://github.com/yourusername/sidekick/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Formatting: human-curated](https://img.shields.io/badge/formatting-human--curated-7c6efc.svg)](#-development)
 
 A powerful personal AI assistant built with LangChain, featuring web search capabilities and deployable on Vercel. Sidekick uses a sophisticated agent architecture with evaluation loops to provide helpful, accurate responses.
 
@@ -29,33 +28,38 @@ A powerful personal AI assistant built with LangChain, featuring web search capa
 ### Installation
 
 1. **Clone the repository**
+
    ```bash
    git clone https://github.com/yourusername/sidekick.git
    cd sidekick
    ```
 
 2. **Create a virtual environment**
+
    ```bash
    python -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
 3. **Install dependencies**
+
    ```bash
    pip install -e ".[dev]"
    ```
 
 4. **Set up environment variables**
+
    ```bash
    cp .env.example .env
    # Edit .env with your API keys
    ```
 
 5. **Run locally**
+
    ```bash
    # Start the API server
    uvicorn api.chat:app --reload --port 8000
-   
+
    # Open public/index.html in your browser
    ```
 
@@ -103,19 +107,30 @@ Sidekick uses a sophisticated agent architecture:
 # Install development dependencies
 pip install -e ".[dev]"
 
-# Install pre-commit hooks
-pre-commit install
+# Install frontend formatting/lint tooling
+npm install
 
 # Run tests
 pytest
 
-# Format code
-black .
-isort .
+# Format frontend/docs
+npm run format
+
+# Check formatting (CI-friendly)
+npm run format:check
+
+# Frontend lint (correctness-focused)
+npm run lint:js
 
 # Type checking
 mypy .
 ```
+
+### Formatting Standards
+
+- **Formatting guide:** See `FORMATTING.md` for project conventions.
+- **Philosophy:** readable, practical formatting over rigid formatter-only output.
+- **Markdown output:** AI responses are normalized to structured markdown (`##`, `**bold**`, `> warnings`, bullet lists).
 
 ### Project Structure
 
@@ -139,6 +154,7 @@ sidekick/
 ### Vercel Deployment
 
 1. **Set up Vercel project**
+
    ```bash
    vercel
    ```
@@ -155,13 +171,13 @@ sidekick/
 
 ### Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | OpenAI API key for GPT models |
-| `TAVILY_API_KEY` | No | Tavily API key for web search |
-| `ENABLE_PLAYWRIGHT` | No | Enable Playwright tools (default: false) |
-| `ENVIRONMENT` | No | Environment mode (development/production) |
-| `PORT` | No | API server port (default: 8000) |
+| Variable            | Required | Description                               |
+| ------------------- | -------- | ----------------------------------------- |
+| `OPENAI_API_KEY`    | Yes      | OpenAI API key for GPT models             |
+| `TAVILY_API_KEY`    | No       | Tavily API key for web search             |
+| `ENABLE_PLAYWRIGHT` | No       | Enable Playwright tools (default: false)  |
+| `ENVIRONMENT`       | No       | Environment mode (development/production) |
+| `PORT`              | No       | API server port (default: 8000)           |
 
 ## 🧪 Testing
 
@@ -188,6 +204,7 @@ pytest -m integration
 Send a message to the AI assistant.
 
 **Request Body:**
+
 ```json
 {
   "message": "string",
@@ -197,6 +214,7 @@ Send a message to the AI assistant.
 ```
 
 **Response:**
+
 ```json
 {
   "thread_id": "string",
@@ -210,6 +228,7 @@ Send a message to the AI assistant.
 Health check endpoint.
 
 **Response:**
+
 ```json
 {
   "status": "ok"
@@ -238,9 +257,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Vercel](https://vercel.com/) for serverless deployment
 - [FastAPI](https://fastapi.tiangolo.com/) for the API framework
 
-
 Made with ❤️ by GMS Ganapathi.
-
-
-
-

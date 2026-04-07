@@ -28,6 +28,7 @@ import sqlite3
 import sys
 import json
 import os
+import re
 import uuid
 import traceback
 from contextlib import asynccontextmanager
@@ -93,6 +94,80 @@ IGNORED_EXTENSIONS = {
     ".exe", ".dll", ".so", ".dylib",
     ".xlsx", ".xls", ".pptx", ".ppt", ".doc", ".rtf",
 }
+
+
+def format_assistant_markdown(raw: str) -> str:
+    """
+    Normalize assistant markdown into a concise, consistent structure.
+
+    Style goals:
+      - Prefer `##` section headings for top-level sections.
+      - Preserve existing markdown headings when already present.
+      - Convert ad-hoc numeric / bold-only title lines into `##`.
+      - Keep warnings visible using blockquotes.
+    """
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+
+    lines = text.split("\n")
+    normalized: List[str] = []
+
+    heading_from_number = re.compile(r"^\s*\d+[\)\.\-:]\s+(.+?)\s*$")
+    heading_from_bold = re.compile(r"^\s*\*\*(.+?)\*\*\s*$")
+    warning_line = re.compile(
+        r"^\s*(warning|important|caution|medical disclaimer)\s*:\s*(.+)$",
+        re.IGNORECASE,
+    )
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            normalized.append("")
+            continue
+
+        # Preserve explicit markdown headings.
+        if stripped.startswith("#"):
+            normalized.append(stripped)
+            continue
+
+        number_match = heading_from_number.match(stripped)
+        if number_match:
+            normalized.append(f"## {number_match.group(1).strip()}")
+            continue
+
+        bold_match = heading_from_bold.match(stripped)
+        if bold_match:
+            normalized.append(f"## {bold_match.group(1).strip()}")
+            continue
+
+        warning_match = warning_line.match(stripped)
+        if warning_match:
+            label = warning_match.group(1).capitalize()
+            body = warning_match.group(2).strip()
+            normalized.append(f"> **{label}:** {body}")
+            continue
+
+        # Normalize list markers while preserving nesting/indentation.
+        if stripped.startswith("* "):
+            indent = len(line) - len(line.lstrip(" "))
+            normalized.append(f"{' ' * indent}- {stripped[2:].strip()}")
+            continue
+
+        normalized.append(line.rstrip())
+
+    # Clean up excessive blank lines (max one blank line between blocks).
+    cleaned: List[str] = []
+    prev_blank = False
+    for line in normalized:
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        cleaned.append(line)
+        prev_blank = is_blank
+
+    return "\n".join(cleaned).strip()
+
 
 # ─────────────────────────────── Pydantic Schemas ────────────────────────────
 
@@ -844,8 +919,9 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                             yield {"event": "status", "data": json.dumps({"text": "🧠 Thinking..."})}
                             txt = content_to_text(getattr(last_msg, "content", None))
                             if txt and not txt.startswith("Evaluator Feedback:"):
-                                latest_assistant_text = txt
-                                yield {"event": "assistant", "data": json.dumps({"text": txt})}
+                                formatted = format_assistant_markdown(txt)
+                                latest_assistant_text = formatted
+                                yield {"event": "assistant", "data": json.dumps({"text": formatted})}
 
                     elif node_name == "tools":
                         yield {"event": "status", "data": json.dumps({"text": "📡 Processing tool results..."})}
@@ -876,7 +952,9 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             yield {
                 "event": "done",
                 "data": json.dumps({
-                    "assistant": latest_assistant_text,
+                    "assistant": format_assistant_markdown(latest_assistant_text)
+                    if latest_assistant_text
+                    else "",
                     "evaluator": "",
                     "thread_id": thread_id,
                 }),
@@ -910,6 +988,8 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
 
         if not assistant_text:
             assistant_text = latest_assistant_text
+
+        assistant_text = format_assistant_markdown(assistant_text)
 
         yield {
             "event": "done",

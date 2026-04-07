@@ -1,101 +1,115 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sidekick · Personal AI Assistant</title>
-  <meta name="description" content="Sidekick — a powerful personal AI assistant with web search, browser automation, and goal-oriented task evaluation." />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="/public/styles.css" />
-</head>
-<body>
-  <div class="app-container">
-
-    <!-- ── Header ─────────────────────────────────────────────────────── -->
-    <header class="header">
-      <div class="header-brand">
-        <div class="header-logo">⚡</div>
-        <div>
-          <div class="header-title">Sidekick</div>
-          <div class="header-subtitle">Personal AI Co-Worker</div>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sidekick · Personal AI Assistant</title>
+    <meta
+      name="description"
+      content="Sidekick — a powerful personal AI assistant with web search, browser automation, and goal-oriented task evaluation."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="/public/styles.css" />
+  </head>
+  <body>
+    <div class="app-container">
+      <!-- ── Header ─────────────────────────────────────────────────────── -->
+      <header class="header">
+        <div class="header-brand">
+          <div class="header-logo">⚡</div>
+          <div>
+            <div class="header-title">Sidekick</div>
+            <div class="header-subtitle">Personal AI Co-Worker</div>
+          </div>
         </div>
-      </div>
-      <div class="header-controls">
-        <button
-          id="themeToggle"
-          class="theme-toggle"
-          aria-label="Toggle light/dark mode"
-          title="Toggle light/dark mode"
-        >☀️</button>
-      </div>
-    </header>
+        <div class="header-controls">
+          <button
+            id="themeToggle"
+            class="theme-toggle"
+            aria-label="Toggle light/dark mode"
+            title="Toggle light/dark mode"
+          >
+            ☀️
+          </button>
+        </div>
+      </header>
 
-    <!-- ── Status Bar ──────────────────────────────────────────────────── -->
-    <div id="statusBar" class="status-bar" role="status" aria-live="polite">
-      <div class="status-dot"></div>
-      <span id="statusText" class="status-text">Ready</span>
-      <div class="spinner" aria-hidden="true"></div>
+      <!-- ── Status Bar ──────────────────────────────────────────────────── -->
+      <div id="statusBar" class="status-bar" role="status" aria-live="polite">
+        <div class="status-dot"></div>
+        <span id="statusText" class="status-text">Ready</span>
+        <div class="spinner" aria-hidden="true"></div>
+      </div>
+
+      <!-- ── Chat Area ───────────────────────────────────────────────────── -->
+      <main id="chatArea" class="chat-area" aria-label="Conversation">
+        <!-- Empty State -->
+        <div id="emptyState" class="empty-state">
+          <div class="empty-icon">🤖</div>
+          <div class="empty-title">How can I help you today?</div>
+          <div class="empty-desc">
+            Type your request below and define your success criteria. I'll
+            search the web, browse pages, and keep working until your goal is
+            met.
+          </div>
+        </div>
+      </main>
+
+      <!-- ── Input Footer ────────────────────────────────────────────────── -->
+      <footer class="input-footer">
+        <div class="input-group">
+          <label class="input-label" for="msgInput">Your Request</label>
+          <textarea
+            id="msgInput"
+            rows="2"
+            placeholder="e.g. Find the top 5 AI news articles from this week..."
+            aria-label="Your request to the agent"
+          ></textarea>
+        </div>
+        <div class="input-group">
+          <label class="input-label" for="criteriaInput"
+            >Success Criteria</label
+          >
+          <textarea
+            id="criteriaInput"
+            rows="1"
+            placeholder="e.g. Provide titles, sources, and a 2-sentence summary for each article."
+            aria-label="Describe what a successful response looks like"
+          ></textarea>
+        </div>
+        <div class="upload-row">
+          <label for="fileInput" class="btn btn-secondary"
+            >📎 Attach files</label
+          >
+          <input
+            id="fileInput"
+            type="file"
+            multiple
+            hidden
+            accept=".pdf,.txt,.md,.docx,.csv,.json,.html,.htm,.js,.ts,.css,.py,.log"
+          />
+          <div id="fileList" class="file-list" aria-live="polite"></div>
+        </div>
+        <div class="action-row">
+          <button
+            id="resetBtn"
+            class="btn btn-danger"
+            aria-label="Reset conversation"
+          >
+            🗑 Reset
+          </button>
+          <button
+            id="sendBtn"
+            class="btn btn-primary"
+            aria-label="Send message"
+          >
+            Send ↵
+          </button>
+        </div>
+      </footer>
     </div>
 
-    <!-- ── Chat Area ───────────────────────────────────────────────────── -->
-    <main id="chatArea" class="chat-area" aria-label="Conversation">
-
-      <!-- Empty State -->
-      <div id="emptyState" class="empty-state">
-        <div class="empty-icon">🤖</div>
-        <div class="empty-title">How can I help you today?</div>
-        <div class="empty-desc">
-          Type your request below and define your success criteria.
-          I'll search the web, browse pages, and keep working until your goal is met.
-        </div>
-      </div>
-
-    </main>
-
-    <!-- ── Input Footer ────────────────────────────────────────────────── -->
-    <footer class="input-footer">
-      <div class="input-group">
-        <label class="input-label" for="msgInput">Your Request</label>
-        <textarea
-          id="msgInput"
-          rows="2"
-          placeholder="e.g. Find the top 5 AI news articles from this week..."
-          aria-label="Your request to the agent"
-        ></textarea>
-      </div>
-      <div class="input-group">
-        <label class="input-label" for="criteriaInput">Success Criteria</label>
-        <textarea
-          id="criteriaInput"
-          rows="1"
-          placeholder="e.g. Provide titles, sources, and a 2-sentence summary for each article."
-          aria-label="Describe what a successful response looks like"
-        ></textarea>
-      </div>
-      <div class="upload-row">
-        <label for="fileInput" class="btn btn-secondary">📎 Attach files</label>
-        <input
-          id="fileInput"
-          type="file"
-          multiple
-          hidden
-          accept=".pdf,.txt,.md,.docx,.csv,.json,.html,.htm,.js,.ts,.css,.py,.log"
-        />
-        <div id="fileList" class="file-list" aria-live="polite"></div>
-      </div>
-      <div class="action-row">
-        <button id="resetBtn" class="btn btn-danger" aria-label="Reset conversation">
-          🗑 Reset
-        </button>
-        <button id="sendBtn" class="btn btn-primary" aria-label="Send message">
-          Send ↵
-        </button>
-      </div>
-    </footer>
-
-  </div>
-
-  <script src="/public/app.js"></script>
-</body>
+    <script src="/public/app.js"></script>
+  </body>
 </html>
