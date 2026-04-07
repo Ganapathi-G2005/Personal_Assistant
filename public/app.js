@@ -158,7 +158,24 @@ function markdownToHtml(markdown) {
       const level = headingMatch[1].length;
       const tag = level === 1 ? "h1" : level === 2 ? "h2" : "h3";
       const headingText = headingMatch[2];
-      out.push(`<${tag}>${applyInlineMarkdown(headingText)}</${tag}>`);
+      // Special case: `## **Label**: rest of sentence` should highlight only
+      // the label, not the entire line (matches your "important terms only"
+      // requirement).
+      const labelWithColon = headingText.match(
+        /^\s*\*\*([^*]+?)\*\*\s*([:.-])\s*(.+)$/,
+      );
+      if (labelWithColon) {
+        const label = labelWithColon[1];
+        const sep = labelWithColon[2];
+        const rest = labelWithColon[3];
+        out.push(
+          `<p>${applyInlineMarkdown(
+            `**${label}**`,
+          )}${sep} ${applyInlineMarkdown(rest)}</p>`,
+        );
+      } else {
+        out.push(`<${tag}>${applyInlineMarkdown(headingText)}</${tag}>`);
+      }
       i += 1;
       continue;
     }
