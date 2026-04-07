@@ -3,6 +3,7 @@ langchain
 langchain-openai
 langchain-community
 langgraph
+langgraph-checkpoint-sqlite
 pydantic
 python-dotenv
 nest_asyncio
@@ -14,3 +15,5 @@ fastapi
 uvicorn[standard]
 sse-starlette
 aiofiles
+aiosqlite
+pypdf

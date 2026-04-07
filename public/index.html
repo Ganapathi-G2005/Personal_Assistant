@@ -73,6 +73,17 @@
           aria-label="Describe what a successful response looks like"
         ></textarea>
       </div>
+      <div class="upload-row">
+        <label for="fileInput" class="btn btn-secondary">📎 Attach files</label>
+        <input
+          id="fileInput"
+          type="file"
+          multiple
+          hidden
+          accept=".pdf,.txt,.md,.docx,.csv,.json,.html,.htm,.js,.ts,.css,.py,.log"
+        />
+        <div id="fileList" class="file-list" aria-live="polite"></div>
+      </div>
       <div class="action-row">
         <button id="resetBtn" class="btn btn-danger" aria-label="Reset conversation">
           🗑 Reset

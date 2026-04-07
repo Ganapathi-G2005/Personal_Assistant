@@ -1,7 +1,0 @@
-README.md
-pyproject.toml
-sidekick.egg-info/PKG-INFO
-sidekick.egg-info/SOURCES.txt
-sidekick.egg-info/dependency_links.txt
-sidekick.egg-info/requires.txt
-sidekick.egg-info/top_level.txt

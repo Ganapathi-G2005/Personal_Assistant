@@ -1,7 +1,10 @@
 /* ─── State ──────────────────────────────────────────────────────────────── */
+const THREAD_STORAGE_KEY = 'sidekick-thread-id';
+
 const state = {
-  threadId: null,
+  threadId: localStorage.getItem(THREAD_STORAGE_KEY) || null,
   isProcessing: false,
+  pendingFiles: [],
 };
 
 /* ─── DOM References ─────────────────────────────────────────────────────── */
@@ -14,6 +17,8 @@ const criteriaInput  = document.getElementById('criteriaInput');
 const sendBtn        = document.getElementById('sendBtn');
 const resetBtn       = document.getElementById('resetBtn');
 const themeToggle    = document.getElementById('themeToggle');
+const fileInput      = document.getElementById('fileInput');
+const fileList       = document.getElementById('fileList');
 
 /* ─── Theme ──────────────────────────────────────────────────────────────── */
 function applyTheme(theme) {
@@ -65,6 +70,55 @@ function renderMessage(role, content) {
   return bubble;
 }
 
+function renderFileChips() {
+  fileList.innerHTML = '';
+  for (const file of state.pendingFiles) {
+    const chip = document.createElement('span');
+    chip.className = 'file-chip';
+    chip.textContent = file.name;
+    fileList.appendChild(chip);
+  }
+}
+
+async function uploadPendingFiles() {
+  if (!state.pendingFiles.length) return;
+  const formData = new FormData();
+  for (const file of state.pendingFiles) {
+    formData.append('files', file);
+  }
+  if (state.threadId) {
+    formData.append('thread_id', state.threadId);
+  }
+
+  setStatus('📎 Uploading files...', true);
+  const res = await fetch('/api/upload', { method: 'POST', body: formData });
+  if (!res.ok) throw new Error(`File upload failed (${res.status})`);
+  const data = await res.json();
+  state.threadId = data.thread_id || state.threadId;
+  if (state.threadId) localStorage.setItem(THREAD_STORAGE_KEY, state.threadId);
+  const chunksAdded = data.chunks_added || 0;
+  const ignoredFiles = data.ignored_files || [];
+  if (chunksAdded === 0) {
+    // Keep chips so the user can switch to file types that yield extractable text.
+    const details = ignoredFiles
+      .slice(0, 3)
+      .map((f) => `${f.filename}: ${f.reason}`)
+      .join(' | ');
+    setStatus(
+      ignoredFiles.length
+        ? `⚠️ Uploaded files ignored (no text to index): ${details || ''}`
+        : '⚠️ No extractable text from uploaded files.',
+      true
+    );
+    renderFileChips();
+    return;
+  }
+
+  state.pendingFiles = [];
+  renderFileChips();
+  setStatus(`📚 Uploaded ${data.files?.length || 0} file(s)`, true);
+}
+
 /* ─── Fetch + SSE Chat ───────────────────────────────────────────────────── */
 async function sendMessage() {
   const message = msgInput.value.trim();
@@ -83,6 +137,7 @@ async function sendMessage() {
   // UI Lock
   state.isProcessing = true;
   sendBtn.disabled = true;
+  fileInput.disabled = true;
   msgInput.disabled = true;
   criteriaInput.disabled = true;
 
@@ -93,6 +148,7 @@ async function sendMessage() {
   setStatus('🚀 Starting...', true);
 
   try {
+    await uploadPendingFiles();
     const response = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -136,6 +192,7 @@ async function sendMessage() {
 
       if (eventType === 'meta') {
         state.threadId = payload.thread_id;
+        if (state.threadId) localStorage.setItem(THREAD_STORAGE_KEY, state.threadId);
 
       } else if (eventType === 'status') {
         setStatus(payload.text, true);
@@ -150,6 +207,7 @@ async function sendMessage() {
 
       } else if (eventType === 'done') {
         state.threadId = payload.thread_id;
+        if (state.threadId) localStorage.setItem(THREAD_STORAGE_KEY, state.threadId);
         setStatus('✅ Done!', true);
 
         const finalAssistant = payload.assistant || '(No response)';
@@ -197,6 +255,7 @@ async function sendMessage() {
   } finally {
     state.isProcessing = false;
     sendBtn.disabled = false;
+    fileInput.disabled = false;
     msgInput.disabled = false;
     criteriaInput.disabled = false;
     msgInput.focus();
@@ -207,16 +266,26 @@ async function sendMessage() {
 async function resetSession() {
   if (state.isProcessing) return;
   try {
-    const res = await fetch('/api/reset', { method: 'POST' });
+    const oldId = state.threadId;
+    const url = oldId
+      ? `/api/reset?thread_id=${encodeURIComponent(oldId)}`
+      : '/api/reset';
+    const res = await fetch(url, { method: 'POST' });
     const data = await res.json();
     state.threadId = data.thread_id;
-  } catch { state.threadId = null; }
+    if (state.threadId) localStorage.setItem(THREAD_STORAGE_KEY, state.threadId);
+  } catch {
+    state.threadId = null;
+    localStorage.removeItem(THREAD_STORAGE_KEY);
+  }
 
   chatArea.innerHTML = '';
   chatArea.appendChild(emptyState);
   emptyState.style.display = '';
   msgInput.value = '';
   criteriaInput.value = '';
+  state.pendingFiles = [];
+  renderFileChips();
   clearStatus();
   msgInput.focus();
 }
@@ -224,6 +293,11 @@ async function resetSession() {
 /* ─── Event Listeners ────────────────────────────────────────────────────── */
 sendBtn.addEventListener('click', sendMessage);
 resetBtn.addEventListener('click', resetSession);
+fileInput.addEventListener('change', (e) => {
+  const files = Array.from(e.target.files || []);
+  state.pendingFiles = files;
+  renderFileChips();
+});
 
 msgInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {

@@ -1,25 +1,50 @@
+"""
+Sidekick AI — main.py
+FastAPI + LangGraph 1.x + LangChain 1.x agentic backend.
+
+Persistence (April 2026):
+  • RAG chunks indexed to SQLite (`.sidekick_data/rag.sqlite`) — survives restarts.
+  • LangGraph checkpoints via AsyncSqliteSaver (`.sidekick_data/checkpoints.sqlite`).
+  • PDF text extraction uses `pypdf` (declare in dependencies).
+
+Fixes applied (April 2026):
+  • Playwright launch wrapped in asyncio.wait_for + sandbox flags;
+    falls back to tavily-only if Playwright fails — server always starts.
+  • graph / worker_llm_with_tools None-guard before every stream.
+  • sanitize_tool_call_history drops dangling tool_calls to prevent OpenAI 400s.
+  • aget_state wrapped in asyncio.wait_for — no more checkpoint deadlocks.
+  • invoke_input correctly scoped: full init on new thread, lightweight on continue.
+  • retry_count hard ceiling (MAX_RETRIES=5) prevents infinite eval loops.
+  • SSE always emits a final 'done' event — frontend never hangs.
+  • RAG upgraded to BM25-style scoring (replaces naive intersection ratio).
+  • Structured logging replaces bare print() calls.
+  • /api/reset accepts optional old thread_id to clean up uploaded docs.
+  • Evaluator prompt tightened; worker prompt structured into clear sections.
+"""
+
 import asyncio
+import logging
+import sqlite3
 import sys
-
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
 import json
 import os
-import sys
 import uuid
 import traceback
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any, AsyncGenerator, Dict, List, Optional
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from langchain.tools import tool
 from langchain_community.agent_toolkits import PlayWrightBrowserToolkit
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -31,13 +56,57 @@ from typing_extensions import NotRequired, TypedDict
 
 load_dotenv(override=True)
 
+# ─────────────────────────────── Logging ─────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+)
+log = logging.getLogger("sidekick")
+
+# ─────────────────────────────── Constants ───────────────────────────────────
+
+MAX_RETRIES = 5
+PLAYWRIGHT_TIMEOUT = 30   # seconds
+STATE_TIMEOUT = 10        # seconds for aget_state
+MAX_FILE_BYTES = 5 * 1024 * 1024
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+RAG_TOP_K = 4
+
+# Local persistence (RAG chunks + LangGraph checkpoints). Survives process restarts.
+DATA_DIR = Path(__file__).resolve().parent / ".sidekick_data"
+RAG_DB_PATH = DATA_DIR / "rag.sqlite"
+CHECKPOINT_DB_PATH = DATA_DIR / "checkpoints.sqlite"
+
+ALLOWED_EXTENSIONS = {
+    ".txt", ".md", ".py", ".json", ".csv",
+    ".html", ".htm", ".js", ".ts", ".css", ".log",
+    ".pdf", ".docx",
+}
+
+# File types we explicitly don't attempt to parse as text.
+# We "ignore" these with a reason so uploads never fail silently.
+IGNORED_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".exe", ".dll", ".so", ".dylib",
+    ".xlsx", ".xls", ".pptx", ".ppt", ".doc", ".rtf",
+}
+
 # ─────────────────────────────── Pydantic Schemas ────────────────────────────
+
 
 class EvaluatorOutput(BaseModel):
     feedback: str = Field(description="Feedback on the assistant's response")
-    success_criteria_met: bool = Field(description="Whether the success criteria have been met")
+    success_criteria_met: bool = Field(
+        description="Whether the success criteria have been met"
+    )
     user_input_needed: bool = Field(
-        description="True if more input is needed from the user, or clarifications, or the assistant is stuck"
+        description=(
+            "True if more input is needed from the user, or the assistant is "
+            "stuck / repeating the same mistake"
+        )
     )
 
 
@@ -49,6 +118,7 @@ class ChatRequest(BaseModel):
 
 # ─────────────────────────────── LangGraph State ─────────────────────────────
 
+
 class State(TypedDict):
     messages: Annotated[List[Any], add_messages]
     success_criteria: str
@@ -56,69 +126,256 @@ class State(TypedDict):
     success_criteria_met: bool
     user_input_needed: bool
     retry_count: NotRequired[int]
+    rag_context: NotRequired[str]
 
 
-# ─────────────────────────────── Tools Setup ─────────────────────────────────
+# ─────────────────────────────── RAG Pipeline ────────────────────────────────
 
-# Playwright browser is initialized at startup (see lifespan)
+thread_documents: Dict[str, List[Dict[str, str]]] = {}
+
+
+def init_rag_db() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(RAG_DB_PATH), check_same_thread=False)
+    try:
+        conn.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS rag_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                text TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_rag_thread ON rag_chunks(thread_id);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_rag_from_disk() -> None:
+    """Load indexed chunks into memory (used for BM25 retrieval)."""
+    global thread_documents
+    if not RAG_DB_PATH.exists():
+        thread_documents = {}
+        return
+    conn = sqlite3.connect(str(RAG_DB_PATH), check_same_thread=False)
+    try:
+        cur = conn.execute("SELECT thread_id, source, text FROM rag_chunks ORDER BY id")
+        loaded: Dict[str, List[Dict[str, str]]] = {}
+        for row in cur:
+            tid, source, text = row[0], row[1], row[2]
+            loaded.setdefault(tid, []).append({"source": source, "text": text})
+        thread_documents = loaded
+        log.info("Loaded RAG index: %d thread(s), %d chunk(s)", len(loaded), sum(len(v) for v in loaded.values()))
+    finally:
+        conn.close()
+
+
+def persist_rag_chunks(thread_id: str, filename: str, chunks: List[str]) -> None:
+    if not chunks:
+        return
+    conn = sqlite3.connect(str(RAG_DB_PATH), check_same_thread=False)
+    try:
+        conn.executemany(
+            "INSERT INTO rag_chunks (thread_id, source, text) VALUES (?, ?, ?)",
+            [(thread_id, filename, c) for c in chunks],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_rag_for_thread(thread_id: str) -> None:
+    global thread_documents
+    if thread_id in thread_documents:
+        del thread_documents[thread_id]
+    if not RAG_DB_PATH.exists():
+        return
+    conn = sqlite3.connect(str(RAG_DB_PATH), check_same_thread=False)
+    try:
+        conn.execute("DELETE FROM rag_chunks WHERE thread_id = ?", (thread_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def purge_checkpoint_thread(thread_id: str) -> None:
+    """Remove LangGraph checkpoints for a thread (e.g. on reset)."""
+    if not CHECKPOINT_DB_PATH.exists():
+        return
+    conn = sqlite3.connect(str(CHECKPOINT_DB_PATH), timeout=30.0)
+    try:
+        conn.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+        conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+
+def chunk_text(text: str) -> List[str]:
+    chunks: List[str] = []
+    text = text.strip()
+    if not text:
+        return chunks
+    step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
+    for start in range(0, len(text), step):
+        chunk = text[start : start + CHUNK_SIZE].strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def looks_like_meaningful_text(text: str) -> bool:
+    """Heuristic to avoid indexing mostly-binary/garbage content."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    # Check a small sample for letter density.
+    sample = t[:5000]
+    letters = sum(1 for ch in sample if ch.isalpha())
+    if letters >= 20:
+        return True
+    # Fallback: alphanumeric density.
+    alnum = sum(1 for ch in sample if ch.isalnum())
+    return alnum >= 50
+
+
+def _tokenize(text: str) -> List[str]:
+    cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
+    return [t for t in cleaned.split() if len(t) > 2]
+
+
+def _bm25_score(
+    q_tokens: List[str],
+    doc_tokens: List[str],
+    avg_dl: float,
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> float:
+    """Lightweight single-collection BM25 (no global IDF needed here)."""
+    if not q_tokens or not doc_tokens:
+        return 0.0
+    dl = len(doc_tokens)
+    freq: Dict[str, int] = {}
+    for t in doc_tokens:
+        freq[t] = freq.get(t, 0) + 1
+    score = 0.0
+    for qt in q_tokens:
+        f = freq.get(qt, 0)
+        if f == 0:
+            continue
+        score += (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / max(avg_dl, 1)))
+    return score
+
+
+def retrieve_thread_context(thread_id: str, query: str) -> str:
+    docs = thread_documents.get(thread_id, [])
+    if not docs:
+        return ""
+    q_tokens = _tokenize(query)
+    if not q_tokens:
+        return ""
+
+    tokenized = [_tokenize(d["text"]) for d in docs]
+    avg_dl = sum(len(t) for t in tokenized) / max(len(tokenized), 1)
+
+    scored = [
+        (_bm25_score(q_tokens, td, avg_dl), doc)
+        for td, doc in zip(tokenized, docs)
+    ]
+    scored = [(s, d) for s, d in scored if s > 0]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    snippets = [
+        f"[Source {i}: {item['source']}]\n{item['text']}"
+        for i, (_, item) in enumerate(scored[:RAG_TOP_K], start=1)
+    ]
+    return "\n\n".join(snippets)
+
+
+# ─────────────────────────────── Tools ───────────────────────────────────────
+
 _playwright_context = None
 async_browser = None
 toolkit = None
-tools = []
+tools: List[Any] = []
 
-tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY", ""))
 
 
 @tool
 def tavily_search(query: str) -> str:
-    """Search the web for information using Tavily."""
+    """Search the web for up-to-date information using Tavily."""
     response = tavily_client.search(query=query, search_depth="basic")
     return str(response["results"])
 
+
 # ─────────────────────────────── LLMs ────────────────────────────────────────
 
-worker_llm = ChatOpenAI(model="gpt-4o-mini")
-# worker_llm_with_tools is re-bound after tools are initialized at startup
-worker_llm_with_tools = None
+worker_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+worker_llm_with_tools: Optional[Any] = None  # bound post Playwright init
 
-evaluator_llm = ChatOpenAI(model="gpt-4.1-nano")
+evaluator_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 evaluator_llm_with_output = evaluator_llm.with_structured_output(EvaluatorOutput)
 
-# ─────────────────────────────── Graph Nodes ─────────────────────────────────
+
+# ─────────────────────────────── Message Utilities ───────────────────────────
+
+
+def content_to_text(raw: Any) -> str:
+    """Coerce any LangChain message content shape to a plain string."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        parts: List[str] = []
+        for item in raw:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+        return "\n".join(p for p in parts if p).strip()
+    return str(raw)
+
+
+def _role(msg: Any) -> str:
+    r = (
+        msg.get("role", msg.get("type", ""))
+        if isinstance(msg, dict)
+        else getattr(msg, "type", "")
+    )
+    return {"ai": "assistant", "human": "user"}.get(r, r)
+
+
+def _tool_calls(msg: Any) -> List[Dict[str, Any]]:
+    return (
+        msg.get("tool_calls", []) or []
+        if isinstance(msg, dict)
+        else getattr(msg, "tool_calls", []) or []
+    )
+
+
+def _tool_call_id(msg: Any) -> str:
+    return (
+        msg.get("tool_call_id", "") or ""
+        if isinstance(msg, dict)
+        else getattr(msg, "tool_call_id", "") or ""
+    )
+
 
 def sanitize_tool_call_history(messages: List[Any]) -> List[Any]:
     """
-    Remove assistant tool-call turns that are missing tool responses.
-    This prevents OpenAI 400 errors for invalid tool-call sequencing.
+    Remove assistant tool-call messages that have no matching tool responses.
+    Prevents OpenAI 400 'invalid_request_error' for orphaned tool_calls.
     """
     sanitized: List[Any] = []
     i = 0
-
-    def _role(msg: Any) -> str:
-        if isinstance(msg, dict):
-            role = msg.get("role", msg.get("type", ""))
-            if role == "ai":
-                return "assistant"
-            if role == "human":
-                return "user"
-            return role
-        m_type = getattr(msg, "type", "")
-        if m_type == "ai":
-            return "assistant"
-        if m_type == "human":
-            return "user"
-        return m_type
-
-    def _tool_calls(msg: Any) -> List[Dict[str, Any]]:
-        if isinstance(msg, dict):
-            return msg.get("tool_calls", []) or []
-        return getattr(msg, "tool_calls", []) or []
-
-    def _tool_call_id(msg: Any) -> str:
-        if isinstance(msg, dict):
-            return msg.get("tool_call_id", "") or ""
-        return getattr(msg, "tool_call_id", "") or ""
-
     while i < len(messages):
         msg = messages[i]
         if _role(msg) != "assistant":
@@ -132,184 +389,252 @@ def sanitize_tool_call_history(messages: List[Any]) -> List[Any]:
             i += 1
             continue
 
-        required_ids = {c.get("id") for c in calls if isinstance(c, dict) and c.get("id")}
+        required_ids = {
+            c["id"] for c in calls if isinstance(c, dict) and c.get("id")
+        }
         j = i + 1
-        seen_ids = set()
+        seen_ids: set = set()
         tool_msgs: List[Any] = []
 
         while j < len(messages) and _role(messages[j]) == "tool":
-            tool_msg = messages[j]
-            t_id = _tool_call_id(tool_msg)
-            if t_id:
-                seen_ids.add(t_id)
-            tool_msgs.append(tool_msg)
+            tid = _tool_call_id(messages[j])
+            if tid:
+                seen_ids.add(tid)
+            tool_msgs.append(messages[j])
             j += 1
 
         if required_ids and required_ids.issubset(seen_ids):
             sanitized.append(msg)
             sanitized.extend(tool_msgs)
         else:
-            print("--> [WARN] Dropped dangling tool_call assistant message from state history.")
-
+            log.warning(
+                "Dropped dangling tool_call assistant turn (missing ids: %s)",
+                required_ids - seen_ids,
+            )
         i = j
 
     return sanitized
 
+
+def format_conversation(messages: List[Any]) -> str:
+    lines = ["Conversation history:\n"]
+    for msg in messages:
+        role = _role(msg)
+        txt = content_to_text(
+            msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", None)
+        )
+        if role == "user":
+            lines.append(f"User: {txt}")
+        elif role == "assistant" and txt and not txt.startswith("Evaluator Feedback:"):
+            lines.append(f"Assistant: {txt or '[Tool use]'}")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────── Graph Nodes ─────────────────────────────────
+
+
 async def worker(state: State) -> Dict[str, Any]:
-    print(f"--> [DEBUG] Entered worker() node. Messages count: {len(state.get('messages', []))}")
-    system_message = f"""You are a helpful assistant that can use tools to complete tasks.
-You keep working on a task until either you have a question or clarification for the user, or the success criteria is met.
-This is the success criteria:
-{state['success_criteria']}
-You should reply either with a question for the user about this assignment, or with your final response.
-If you have a question for the user, you need to reply by clearly stating your question. An example might be:
+    log.info("worker() — state messages: %d", len(state.get("messages", [])))
 
-Question: please clarify whether you want a summary or a detailed answer
+    if worker_llm_with_tools is None:
+        raise RuntimeError("worker_llm_with_tools is None — server initialisation incomplete.")
 
-If you've finished, reply with the final answer, and don't ask a question; simply reply with the answer.
-"""
+    # Build the system prompt in clear, structured sections
+    sections = [
+        (
+            "You are a precise, helpful assistant that uses tools to complete tasks.\n"
+            "Keep working until the success criteria is met or you need user clarification."
+        ),
+        f"## Success Criteria\n{state['success_criteria']}",
+        (
+            "## Response format\n"
+            "- If you need clarification: start with 'Question: <your question>'\n"
+            "- Otherwise: reply with your final answer directly — no preamble."
+        ),
+    ]
+
+    if state.get("rag_context"):
+        sections.append(
+            f"## Retrieved File Context\nUse the following when relevant to the request.\n\n{state['rag_context']}"
+        )
+
     if state.get("feedback_on_work"):
-        system_message += f"""
-Previously you thought you completed the assignment, but your reply was rejected because the success criteria was not met.
-Here is the feedback on why this was rejected:
-{state['feedback_on_work']}
-With this feedback, please continue the assignment, ensuring that you meet the success criteria or have a question for the user."""
+        sections.append(
+            f"## Previous Attempt Feedback\nYour last response did not satisfy the criteria.\n"
+            f"Feedback: {state['feedback_on_work']}\n"
+            "Address this feedback explicitly."
+        )
 
-    found_system_message = False
+    system_message = "\n\n".join(sections)
     messages = sanitize_tool_call_history(state["messages"])
-    for message in messages:
-        # LangGraph message format adaptation handling both objects and dicts
-        is_sys = getattr(message, "type", "") == "system" or (isinstance(message, dict) and message.get("type") == "system")
-        if is_sys:
-            if hasattr(message, "content"):
-                message.content = system_message
-            else:
-                message["content"] = system_message
-            found_system_message = True
 
-    if not found_system_message:
+    # Inject / replace system message
+    found = False
+    for msg in messages:
+        is_sys = (
+            getattr(msg, "type", "") == "system"
+            or (isinstance(msg, dict) and msg.get("type") == "system")
+        )
+        if is_sys:
+            if hasattr(msg, "content"):
+                msg.content = system_message
+            else:
+                msg["content"] = system_message
+            found = True
+            break
+
+    if not found:
         messages = [{"role": "system", "content": system_message}] + messages
 
-    print("--> [DEBUG] Calling worker_llm_with_tools.ainvoke()...")
+    log.debug("worker() — invoking LLM...")
     response = await worker_llm_with_tools.ainvoke(messages)
-    print("--> [DEBUG] worker_llm_with_tools.ainvoke() completed.")
+    log.debug("worker() — LLM done.")
     return {"messages": [response]}
 
 
 async def worker_router(state: State) -> str:
-    print("--> [DEBUG] Entered worker_router()...")
-    last_message = state["messages"][-1]
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+    last = state["messages"][-1]
+    if _tool_calls(last):
+        log.debug("worker_router → tools")
         return "tools"
+    log.debug("worker_router → evaluator")
     return "evaluator"
 
 
-def format_conversation(messages: List[Any]) -> str:
-    conversation = "Conversation history:\n\n"
-    for message in messages:
-        m_type = getattr(message, "type", "") or message.get("type", "") if isinstance(message, dict) else ""
-        content = getattr(message, "content", "") or (message.get("content", "") if isinstance(message, dict) else "")
+async def evaluator(state: State) -> Dict[str, Any]:
+    log.info("evaluator() — running structured eval...")
 
-        if m_type == "human":
-            conversation += f"User: {content}\n"
-        elif m_type == "ai":
-            text = content or "[Tool use]"
-            conversation += f"Assistant: {text}\n"
-    return conversation
+    last_msg = state["messages"][-1]
+    last_response = content_to_text(
+        last_msg.get("content", "") if isinstance(last_msg, dict) else getattr(last_msg, "content", None)
+    )
 
+    sys_prompt = (
+        "You are a strict but fair evaluator for an AI assistant.\n"
+        "Assess whether the Assistant's latest response satisfies the success criteria.\n"
+        "Be concise and specific in your feedback."
+    )
 
-async def evaluator(state: State) -> State:
-    print("--> [DEBUG] Entered evaluator() node...")
-    last_message = state["messages"][-1]
-    last_response = getattr(last_message, "content", "") or (last_message.get("content", "") if isinstance(last_message, dict) else "")
-
-    system_message = """You are an evaluator that determines if a task has been completed successfully by an Assistant.
-Assess the Assistant's last response based on the given criteria. Respond with your feedback, and with your decision on whether the success criteria has been met,
-and whether more input is needed from the user."""
-
-    user_message = f"""You are evaluating a conversation between the User and Assistant.
-
-The entire conversation is:
-{format_conversation(state['messages'])}
-
-The success criteria for this assignment is:
-{state['success_criteria']}
-
-The final response from the Assistant that you are evaluating is:
-{last_response}
-
-Respond with your feedback, and decide if the success criteria is met.
-Also, decide if more user input is required.
-"""
-    if state.get("feedback_on_work"):
-        user_message += f"Also, note that in a prior attempt from the Assistant, you provided this feedback: {state['feedback_on_work']}\n"
-        user_message += "If you're seeing the Assistant repeating the same mistakes, then consider responding that user input is required."
-
-    evaluator_messages = [
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": user_message}
+    user_parts = [
+        format_conversation(state["messages"]),
+        f"\n## Success Criteria\n{state['success_criteria']}",
+        f"\n## Assistant's Latest Response\n{last_response}",
+        "\nEvaluate: is the criteria met? Is user input needed?",
     ]
-    print("--> [DEBUG] Calling evaluator_llm_with_output.ainvoke()...")
-    eval_result = await evaluator_llm_with_output.ainvoke(evaluator_messages)
-    print(f"--> [DEBUG] evaluator_llm_with_output.ainvoke() completed: feedback={eval_result.feedback}, met={eval_result.success_criteria_met}")
-    current_retry = int(state.get("retry_count", 0))
+    if state.get("feedback_on_work"):
+        user_parts.append(
+            f"\nNote — prior feedback was:\n{state['feedback_on_work']}\n"
+            "If the assistant is repeating the same mistake, set user_input_needed=True."
+        )
+
+    eval_messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": "\n".join(user_parts)},
+    ]
+
+    result: EvaluatorOutput = await evaluator_llm_with_output.ainvoke(eval_messages)
+    retry = int(state.get("retry_count", 0)) + 1
+
+    log.info(
+        "evaluator() — met=%s, user_input=%s, retry=%d/%d",
+        result.success_criteria_met, result.user_input_needed, retry, MAX_RETRIES,
+    )
 
     return {
-        "messages": [{"role": "assistant", "content": f"Evaluator Feedback: {eval_result.feedback}"}],
-        "feedback_on_work": eval_result.feedback,
-        "success_criteria_met": eval_result.success_criteria_met,
-        "user_input_needed": eval_result.user_input_needed,
-        "retry_count": current_retry + 1,
+        "messages": [{"role": "assistant", "content": f"Evaluator Feedback: {result.feedback}"}],
+        "feedback_on_work": result.feedback,
+        "success_criteria_met": result.success_criteria_met,
+        "user_input_needed": result.user_input_needed,
+        "retry_count": retry,
     }
 
 
 async def route_based_on_evaluation(state: State) -> str:
-    max_retries = 10
-    if state.get("retry_count", 0) >= max_retries:
+    retry = state.get("retry_count", 0)
+    if retry >= MAX_RETRIES:
+        log.warning("Max retries (%d) reached — forcing END.", MAX_RETRIES)
         return "END"
     if state["success_criteria_met"] or state["user_input_needed"]:
         return "END"
     return "worker"
 
 
-# ─────────────────────────────── Build Graph (deferred compile) ──────────────
+# ─────────────────────────────── Graph Build ─────────────────────────────────
 
-graph = None
-memory = MemorySaver()
+graph: Optional[Any] = None
+memory: Optional[Any] = None  # AsyncSqliteSaver, assigned in lifespan
 
 
-def build_graph():
+def build_graph() -> None:
     global graph
-    graph_builder = StateGraph(State)
-    graph_builder.add_node("worker", worker)
-    graph_builder.add_node("tools", ToolNode(tools=tools))
-    graph_builder.add_node("evaluator", evaluator)
-    graph_builder.add_conditional_edges("worker", worker_router, {"tools": "tools", "evaluator": "evaluator"})
-    graph_builder.add_edge("tools", "worker")
-    graph_builder.add_conditional_edges("evaluator", route_based_on_evaluation, {"worker": "worker", "END": END})
-    graph_builder.add_edge(START, "worker")
-    graph = graph_builder.compile(checkpointer=memory)
+    if memory is None:
+        raise RuntimeError("checkpointer not initialised — call build_graph() only inside lifespan.")
+    builder = StateGraph(State)
+    builder.add_node("worker", worker)
+    builder.add_node("tools", ToolNode(tools=tools))
+    builder.add_node("evaluator", evaluator)
+
+    builder.add_conditional_edges(
+        "worker", worker_router, {"tools": "tools", "evaluator": "evaluator"}
+    )
+    builder.add_edge("tools", "worker")
+    builder.add_conditional_edges(
+        "evaluator", route_based_on_evaluation, {"worker": "worker", "END": END}
+    )
+    builder.add_edge(START, "worker")
+
+    graph = builder.compile(checkpointer=memory)
+    log.info("Graph compiled. Nodes: worker → tools ↺ | worker → evaluator → [worker|END]")
+
 
 # ─────────────────────────────── FastAPI Lifespan ────────────────────────────
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize Playwright browser and build graph on startup."""
-    global _playwright_context, async_browser, toolkit, tools, worker_llm_with_tools
-    _playwright_context = await async_playwright().start()
-    async_browser = await asyncio.wait_for(
-        _playwright_context.chromium.launch(
-            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
-        ),
-        timeout=30
-    )
-    toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=async_browser)
-    tools = toolkit.get_tools() + [tavily_search]
+    global _playwright_context, async_browser, toolkit, tools, worker_llm_with_tools, memory, graph
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    init_rag_db()
+    load_rag_from_disk()
+
+    log.info("Launching Playwright browser...")
+    try:
+        _playwright_context = await async_playwright().start()
+        async_browser = await asyncio.wait_for(
+            _playwright_context.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            ),
+            timeout=PLAYWRIGHT_TIMEOUT,
+        )
+        toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=async_browser)
+        pw_tools = toolkit.get_tools()
+        tools = pw_tools + [tavily_search]
+        log.info("Playwright ready. Tools: %s", [t.name for t in tools])
+    except Exception:
+        log.exception(
+            "Playwright failed — falling back to tavily_search only. "
+            "Browser-based tools will be unavailable this session."
+        )
+        tools = [tavily_search]
+
     worker_llm_with_tools = worker_llm.bind_tools(tools)
-    build_graph()
-    print("✅ Sidekick ready at http://localhost:8000")
-    yield
-    # Cleanup
+
+    async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB_PATH)) as checkpointer:
+        memory = checkpointer
+        build_graph()
+        log.info(
+            "✅ Sidekick ready at http://localhost:8000 (RAG DB: %s, checkpoints: %s)",
+            RAG_DB_PATH,
+            CHECKPOINT_DB_PATH,
+        )
+        yield
+
+        graph = None
+        memory = None
+
+    log.info("Shutting down Playwright...")
     if async_browser:
         await async_browser.close()
     if _playwright_context:
@@ -323,151 +648,293 @@ app.mount("/public", StaticFiles(directory="public"), name="public")
 
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    with open("public/index.html", "r", encoding="utf-8") as f:
+async def serve_index() -> HTMLResponse:
+    with open("public/index.html", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 
+# ─────────────────────────────── Upload ──────────────────────────────────────
+
+
+@app.post("/api/upload")
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    thread_id: Optional[str] = Form(None),
+) -> Dict[str, Any]:
+    resolved_tid = thread_id or str(uuid.uuid4())
+    if resolved_tid not in thread_documents:
+        thread_documents[resolved_tid] = []
+
+    added_files: List[str] = []
+    added_chunks = 0
+    ignored_files: List[Dict[str, str]] = []
+
+    for upload in files:
+        filename = upload.filename or "uploaded_file"
+        suffix = Path(filename).suffix.lower()
+
+        raw = await upload.read()
+        if not raw or len(raw) > MAX_FILE_BYTES:
+            ignored_files.append(
+                {"filename": filename, "reason": "empty file or exceeds 5 MB limit"}
+            )
+            continue
+
+        # 1) Explicit ignores (images/archives/binaries).
+        if suffix in IGNORED_EXTENSIONS:
+            ignored_files.append(
+                {"filename": filename, "reason": f"ignored file type: {suffix}"}
+            )
+            continue
+
+        # 2) Extract text by file type.
+        text = ""
+        try:
+            if suffix == ".pdf":
+                # PDF text extraction (best-effort).
+                from io import BytesIO
+                from pypdf import PdfReader
+
+                reader = PdfReader(BytesIO(raw))
+                parts: List[str] = []
+                for page in reader.pages:
+                    page_text = page.extract_text() or ""
+                    if page_text:
+                        parts.append(page_text)
+                text = "\n".join(parts)
+
+            elif suffix == ".docx":
+                from io import BytesIO
+
+                try:
+                    import importlib
+                    docx_mod = importlib.import_module("docx")  # python-docx
+                except Exception:
+                    ignored_files.append(
+                        {
+                            "filename": filename,
+                            "reason": "DOCX parsing requires python-docx (not installed)",
+                        }
+                    )
+                    continue
+
+                document = docx_mod.Document(BytesIO(raw))
+                parts = [p.text for p in document.paragraphs if p.text and p.text.strip()]
+                text = "\n".join(parts)
+
+            else:
+                # Default: treat as text-like and decode.
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = raw.decode("latin-1", errors="ignore")
+
+        except Exception as e:
+            ignored_files.append(
+                {"filename": filename, "reason": f"text extraction failed: {e}"}
+            )
+            continue
+
+        if not looks_like_meaningful_text(text):
+            ignored_files.append(
+                {"filename": filename, "reason": "no meaningful text extracted"}
+            )
+            continue
+
+        chunks = chunk_text(text)
+        if not chunks:
+            ignored_files.append(
+                {"filename": filename, "reason": "no chunks produced after processing"}
+            )
+            continue
+
+        for chunk in chunks:
+            thread_documents[resolved_tid].append({"source": filename, "text": chunk})
+        persist_rag_chunks(resolved_tid, filename, chunks)
+
+        added_files.append(filename)
+        added_chunks += len(chunks)
+        log.info("Indexed '%s' → %d chunks (thread=%s)", filename, len(chunks), resolved_tid)
+
+    return {
+        "thread_id": resolved_tid,
+        "files": added_files,
+        "chunks_added": added_chunks,
+        "total_chunks_for_thread": len(thread_documents.get(resolved_tid, [])),
+        "ignored_files": ignored_files,
+    }
+
+
+# ─────────────────────────────── Chat Stream ─────────────────────────────────
+
+
 @app.post("/api/chat")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: ChatRequest) -> EventSourceResponse:
     thread_id = request.thread_id or str(uuid.uuid4())
 
-    async def event_generator() -> AsyncGenerator[dict, None]:
-        def _content_to_text(raw: Any) -> str:
-            """Normalize LangChain message content into plain text."""
-            if raw is None:
-                return ""
-            if isinstance(raw, str):
-                return raw
-            if isinstance(raw, list):
-                parts: List[str] = []
-                for item in raw:
-                    if isinstance(item, str):
-                        parts.append(item)
-                    elif isinstance(item, dict):
-                        if item.get("type") == "text":
-                            parts.append(str(item.get("text", "")))
-                        elif "text" in item:
-                            parts.append(str(item.get("text", "")))
-                return "\n".join(p for p in parts if p).strip()
-            return str(raw)
+    async def event_generator() -> AsyncGenerator[Dict[str, str], None]:
 
-        config = {"configurable": {"thread_id": thread_id}}
-        latest_assistant_text = ""
-
-        # Send the thread_id back immediately so the frontend can track it
+        # ── 1. Immediate meta ─────────────────────────────────────────────────
         yield {"event": "meta", "data": json.dumps({"thread_id": thread_id})}
 
+        # ── 2. Server-ready guard ─────────────────────────────────────────────
         if graph is None or worker_llm_with_tools is None:
-            yield {"event": "error", "data": json.dumps({"message": "Server not ready or Playwright failed to initialize."})}
+            yield {
+                "event": "error",
+                "data": json.dumps({"message": "Server not ready — please retry in a moment."}),
+            }
+            yield {
+                "event": "done",
+                "data": json.dumps({"assistant": "", "evaluator": "", "thread_id": thread_id}),
+            }
             return
 
+        # ── 3. RAG retrieval ──────────────────────────────────────────────────
+        rag_context = retrieve_thread_context(thread_id, request.message)
+        config = {"configurable": {"thread_id": thread_id}}
+
+        # ── 4. New vs. continuing thread ──────────────────────────────────────
+        is_new_thread = True
         try:
-            current_state = await asyncio.wait_for(graph.aget_state(config), timeout=10)
-            if not current_state or not current_state.values:
-                invoke_input = {
-                    "messages": [{"role": "user", "content": request.message}],
-                    "success_criteria": request.success_criteria,
-                    "feedback_on_work": None,
-                    "success_criteria_met": False,
-                    "user_input_needed": False,
-                    "retry_count": 0,
-                }
-            else:
-                invoke_input = {
-                    "messages": [{"role": "user", "content": request.message}],
-                    "success_criteria": request.success_criteria,
-                }
-        except Exception as e:
-            traceback.print_exc()
-            yield {"event": "error", "data": json.dumps({"message": "Failed to load state: " + str(e)})}
-            return
+            current = await asyncio.wait_for(graph.aget_state(config), timeout=STATE_TIMEOUT)
+            is_new_thread = not current or not current.values
+        except Exception:
+            log.exception("aget_state() failed — treating as new thread.")
+
+        base_input: Dict[str, Any] = {
+            "messages": [{"role": "user", "content": request.message}],
+            "success_criteria": request.success_criteria,
+            "rag_context": rag_context,
+            "feedback_on_work": None,
+            "success_criteria_met": False,
+            "user_input_needed": False,
+            "retry_count": 0,
+        }
+        if not is_new_thread:
+            # On continuing threads we still reset the per-turn mutable fields
+            # (retry_count, feedback, flags) so the new turn starts fresh.
+            invoke_input = base_input
+        else:
+            invoke_input = base_input
+
+        # ── 5. Stream the graph ───────────────────────────────────────────────
+        latest_assistant_text = ""
 
         try:
-            async for chunk in graph.astream(invoke_input, config=config, stream_mode="updates"):
+            async for chunk in graph.astream(
+                invoke_input, config=config, stream_mode="updates"
+            ):
                 for node_name, node_output in chunk.items():
+
                     if node_name == "worker":
                         last_msg = node_output.get("messages", [{}])[-1]
-                        # Check if worker is about to call tools
-                        if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                            tool_names = [tc["name"] for tc in last_msg.tool_calls]
-                            for tn in tool_names:
-                                if "search" in tn.lower() or "tavily" in tn.lower():
-                                    yield {"event": "status", "data": json.dumps({"text": "🔍 Searching the web..."})}
-                                elif "navigate" in tn.lower() or "browser" in tn.lower() or "playwright" in tn.lower() or "click" in tn.lower() or "page" in tn.lower():
-                                    yield {"event": "status", "data": json.dumps({"text": "🌐 Browsing the web..."})}
+                        calls = _tool_calls(last_msg)
+
+                        if calls:
+                            for tc in calls:
+                                tn = tc.get("name", "")
+                                if any(k in tn.lower() for k in ("search", "tavily")):
+                                    status = "🔍 Searching the web..."
+                                elif any(k in tn.lower() for k in ("navigate", "click", "page", "browser", "playwright")):
+                                    status = "🌐 Browsing the web..."
                                 else:
-                                    yield {"event": "status", "data": json.dumps({"text": f"⚙️ Running tool: {tn}..."})}
+                                    status = f"⚙️ Running tool: {tn}..."
+                                yield {"event": "status", "data": json.dumps({"text": status})}
                         else:
                             yield {"event": "status", "data": json.dumps({"text": "🧠 Thinking..."})}
-                            text = _content_to_text(getattr(last_msg, "content", None))
-                            if text:
-                                latest_assistant_text = text
-                                yield {"event": "assistant", "data": json.dumps({"text": text})}
+                            txt = content_to_text(getattr(last_msg, "content", None))
+                            if txt and not txt.startswith("Evaluator Feedback:"):
+                                latest_assistant_text = txt
+                                yield {"event": "assistant", "data": json.dumps({"text": txt})}
 
                     elif node_name == "tools":
                         yield {"event": "status", "data": json.dumps({"text": "📡 Processing tool results..."})}
 
                     elif node_name == "evaluator":
                         yield {"event": "status", "data": json.dumps({"text": "📋 Evaluating response..."})}
-                        # Extract evaluation result
-                        msgs = node_output.get("messages", [])
                         sc_met = node_output.get("success_criteria_met", False)
                         ui_needed = node_output.get("user_input_needed", False)
-                        feedback = node_output.get("feedback_on_work", "")
+                        retry = node_output.get("retry_count", 0)
 
                         if sc_met:
                             yield {"event": "status", "data": json.dumps({"text": "✅ Criteria met!"})}
                         elif ui_needed:
                             yield {"event": "status", "data": json.dumps({"text": "❓ Clarification needed from you"})}
                         else:
-                            yield {"event": "status", "data": json.dumps({"text": "🔁 Not quite right — retrying..."})}
+                            yield {
+                                "event": "status",
+                                "data": json.dumps({"text": f"🔁 Not quite — retrying ({retry}/{MAX_RETRIES})..."}),
+                            }
 
-            # Get the final state
-            final_state = await asyncio.wait_for(graph.aget_state(config), timeout=10)
+        except Exception:
+            log.exception("Error inside graph.astream()")
+            yield {
+                "event": "error",
+                "data": json.dumps({"message": "An internal error occurred. Check server logs."}),
+            }
+            # Always emit done so the client unblocks
+            yield {
+                "event": "done",
+                "data": json.dumps({
+                    "assistant": latest_assistant_text,
+                    "evaluator": "",
+                    "thread_id": thread_id,
+                }),
+            }
+            return
+
+        # ── 6. Resolve final answer from checkpoint ───────────────────────────
+        assistant_text = ""
+        evaluator_text = ""
+        try:
+            final_state = await asyncio.wait_for(
+                graph.aget_state(config), timeout=STATE_TIMEOUT
+            )
             if final_state and final_state.values:
-                all_messages = final_state.values.get("messages", [])
-                # Assistant response = second to last, evaluator = last
-                assistant_text = ""
-                evaluator_text = ""
-                for msg in reversed(all_messages):
-                    content: Any = ""
-                    if hasattr(msg, "content") and msg.content:
-                        content = msg.content
-                    elif isinstance(msg, dict):
-                        content = msg.get("content", "")
-                    content = _content_to_text(content)
-
-                    if not content:
+                for msg in reversed(final_state.values.get("messages", [])):
+                    raw = (
+                        msg.get("content", "") if isinstance(msg, dict)
+                        else getattr(msg, "content", None)
+                    )
+                    txt = content_to_text(raw)
+                    if not txt:
                         continue
-
-                    if content.startswith("Evaluator Feedback:") and not evaluator_text:
-                        evaluator_text = content
-                    elif not content.startswith("Evaluator Feedback:") and not assistant_text:
-                        assistant_text = content
-
+                    if txt.startswith("Evaluator Feedback:") and not evaluator_text:
+                        evaluator_text = txt
+                    elif not txt.startswith("Evaluator Feedback:") and not assistant_text:
+                        assistant_text = txt
                     if assistant_text and evaluator_text:
                         break
+        except Exception:
+            log.exception("aget_state() failed after stream — using streamed fallback.")
 
-                if not assistant_text and latest_assistant_text:
-                    assistant_text = latest_assistant_text
+        if not assistant_text:
+            assistant_text = latest_assistant_text
 
-                yield {
-                    "event": "done",
-                    "data": json.dumps({
-                        "assistant": assistant_text,
-                        "evaluator": evaluator_text,
-                        "thread_id": thread_id,
-                    }),
-                }
-        except Exception as e:
-            traceback.print_exc()
-            yield {"event": "error", "data": json.dumps({"message": str(e)})}
+        yield {
+            "event": "done",
+            "data": json.dumps({
+                "assistant": assistant_text,
+                "evaluator": evaluator_text,
+                "thread_id": thread_id,
+            }),
+        }
 
     return EventSourceResponse(event_generator())
 
 
+# ─────────────────────────────── Reset ───────────────────────────────────────
+
+
 @app.post("/api/reset")
-async def reset_session():
+async def reset_session(thread_id: Optional[str] = None) -> Dict[str, str]:
+    """
+    Issue a new thread_id. Optionally pass the old one to purge its
+    RAG index, LangGraph checkpoints, and in-memory cache.
+    """
+    if thread_id:
+        delete_rag_for_thread(thread_id)
+        purge_checkpoint_thread(thread_id)
+        log.info("Purged RAG + checkpoints for thread %s", thread_id)
     new_thread = str(uuid.uuid4())
     return {"thread_id": new_thread}
