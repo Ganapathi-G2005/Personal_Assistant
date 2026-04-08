@@ -17,3 +17,4 @@ sse-starlette
 aiofiles
 aiosqlite
 pypdf
+lxml

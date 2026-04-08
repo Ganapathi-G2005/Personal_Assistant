@@ -24,6 +24,7 @@ Fixes applied (April 2026):
 
 import asyncio
 import logging
+import math
 import sqlite3
 import sys
 import json
@@ -74,6 +75,7 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
 RAG_TOP_K = 4
+MAX_CHUNKS_PER_SOURCE = 2
 
 # Local persistence (RAG chunks + LangGraph checkpoints). Survives process restarts.
 DATA_DIR = Path(__file__).resolve().parent / ".sidekick_data"
@@ -294,15 +296,59 @@ def purge_checkpoint_thread(thread_id: str) -> None:
 
 def chunk_text(text: str) -> List[str]:
     chunks: List[str] = []
-    text = text.strip()
+    text = (text or "").strip()
     if not text:
         return chunks
-    step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
-    for start in range(0, len(text), step):
-        chunk = text[start : start + CHUNK_SIZE].strip()
-        if chunk:
-            chunks.append(chunk)
-    return chunks
+
+    # Prefer paragraph/sentence-aware chunking to avoid cutting context mid-thought.
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text]
+
+    current = ""
+    for para in paragraphs:
+        candidate = f"{current}\n\n{para}".strip() if current else para
+        if len(candidate) <= CHUNK_SIZE:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        # Paragraph alone is still too long; split by sentence boundaries first.
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", para) if s.strip()]
+        if not sentences:
+            sentences = [para]
+
+        sentence_acc = ""
+        for sentence in sentences:
+            s_candidate = f"{sentence_acc} {sentence}".strip() if sentence_acc else sentence
+            if len(s_candidate) <= CHUNK_SIZE:
+                sentence_acc = s_candidate
+                continue
+            if sentence_acc:
+                chunks.append(sentence_acc)
+            sentence_acc = sentence
+        if sentence_acc:
+            chunks.append(sentence_acc)
+
+    if current:
+        chunks.append(current)
+
+    # Add overlap for continuity between adjacent chunks.
+    if CHUNK_OVERLAP > 0 and len(chunks) > 1:
+        overlapped: List[str] = [chunks[0]]
+        for i in range(1, len(chunks)):
+            prev_tail = chunks[i - 1][-CHUNK_OVERLAP:].strip()
+            if prev_tail:
+                merged = f"{prev_tail}\n{chunks[i]}".strip()
+                overlapped.append(merged[: CHUNK_SIZE + CHUNK_OVERLAP])
+            else:
+                overlapped.append(chunks[i])
+        chunks = overlapped
+
+    return [c for c in chunks if c.strip()]
 
 
 def looks_like_meaningful_text(text: str) -> bool:
@@ -322,17 +368,25 @@ def looks_like_meaningful_text(text: str) -> bool:
 
 def _tokenize(text: str) -> List[str]:
     cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
-    return [t for t in cleaned.split() if len(t) > 2]
+    stopwords = {
+        "the", "and", "for", "with", "that", "this", "from", "are", "was", "were",
+        "you", "your", "about", "into", "than", "then", "they", "them", "their",
+        "have", "has", "had", "not", "but", "can", "could", "would", "should",
+        "what", "when", "where", "which", "will", "just", "over", "under", "after",
+    }
+    tokens = [t for t in cleaned.split() if len(t) >= 2]
+    return [t for t in tokens if t not in stopwords]
 
 
 def _bm25_score(
     q_tokens: List[str],
     doc_tokens: List[str],
+    idf_by_term: Dict[str, float],
     avg_dl: float,
     k1: float = 1.5,
     b: float = 0.75,
 ) -> float:
-    """Lightweight single-collection BM25 (no global IDF needed here)."""
+    """BM25 with per-thread IDF for better lexical relevance."""
     if not q_tokens or not doc_tokens:
         return 0.0
     dl = len(doc_tokens)
@@ -344,7 +398,10 @@ def _bm25_score(
         f = freq.get(qt, 0)
         if f == 0:
             continue
-        score += (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / max(avg_dl, 1)))
+        idf = idf_by_term.get(qt, 0.0)
+        if idf <= 0:
+            continue
+        score += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / max(avg_dl, 1)))
     return score
 
 
@@ -353,22 +410,69 @@ def retrieve_thread_context(thread_id: str, query: str) -> str:
     if not docs:
         return ""
     q_tokens = _tokenize(query)
+    tokenized_docs = [_tokenize(d["text"]) for d in docs]
+    avg_dl = sum(len(t) for t in tokenized_docs) / max(len(tokenized_docs), 1)
+
+    # No lexical query tokens (or everything filtered): return representative
+    # chunks while preserving source diversity.
     if not q_tokens:
-        return ""
+        selected: List[tuple[float, Dict[str, str]]] = []
+        per_source: Dict[str, int] = {}
+        for doc in docs:
+            src = doc["source"]
+            if per_source.get(src, 0) >= MAX_CHUNKS_PER_SOURCE:
+                continue
+            selected.append((0.0, doc))
+            per_source[src] = per_source.get(src, 0) + 1
+            if len(selected) >= RAG_TOP_K:
+                break
+        final_docs = selected
+    else:
+        n_docs = len(tokenized_docs)
+        df: Dict[str, int] = {}
+        for dt in tokenized_docs:
+            for t in set(dt):
+                df[t] = df.get(t, 0) + 1
+        idf_by_term = {
+            t: math.log(1 + ((n_docs - dft + 0.5) / (dft + 0.5)))
+            for t, dft in df.items()
+        }
 
-    tokenized = [_tokenize(d["text"]) for d in docs]
-    avg_dl = sum(len(t) for t in tokenized) / max(len(tokenized), 1)
+        scored = [
+            (_bm25_score(q_tokens, td, idf_by_term, avg_dl), doc)
+            for td, doc in zip(tokenized_docs, docs)
+        ]
+        scored.sort(key=lambda x: x[0], reverse=True)
 
-    scored = [
-        (_bm25_score(q_tokens, td, avg_dl), doc)
-        for td, doc in zip(tokenized, docs)
-    ]
-    scored = [(s, d) for s, d in scored if s > 0]
-    scored.sort(key=lambda x: x[0], reverse=True)
+        positive_scored = [(s, d) for s, d in scored if s > 0]
+        candidate_docs = positive_scored if positive_scored else scored
+
+        # Keep top-k relevant chunks but avoid single-source domination.
+        selected: List[tuple[float, Dict[str, str]]] = []
+        per_source: Dict[str, int] = {}
+        for score, doc in candidate_docs:
+            src = doc["source"]
+            if per_source.get(src, 0) >= MAX_CHUNKS_PER_SOURCE:
+                continue
+            selected.append((score, doc))
+            per_source[src] = per_source.get(src, 0) + 1
+            if len(selected) >= RAG_TOP_K:
+                break
+
+        # Backfill if diversity constraints underfill top-k.
+        if len(selected) < min(RAG_TOP_K, len(candidate_docs)):
+            seen_ids = {id(d) for _, d in selected}
+            for score, doc in candidate_docs:
+                if id(doc) in seen_ids:
+                    continue
+                selected.append((score, doc))
+                if len(selected) >= RAG_TOP_K:
+                    break
+        final_docs = selected
 
     snippets = [
         f"[Source {i}: {item['source']}]\n{item['text']}"
-        for i, (_, item) in enumerate(scored[:RAG_TOP_K], start=1)
+        for i, (_, item) in enumerate(final_docs, start=1)
     ]
     return "\n\n".join(snippets)
 
@@ -518,7 +622,10 @@ async def worker(state: State) -> Dict[str, Any]:
     sections = [
         (
             "You are a precise, helpful assistant that uses tools to complete tasks.\n"
-            "Keep working until the success criteria is met or you need user clarification."
+            "Keep working until the success criteria is met or you need user clarification.\n"
+            "IMPORTANT: If the user asks about an uploaded document, file, or PDF, its contents are ALREADY "
+            "provided to you in the 'Retrieved File Context' section below. Read the context and answer directly, "
+            "do NOT claim you cannot access or read the file."
         ),
         f"## Success Criteria\n{state['success_criteria']}",
         (
@@ -541,28 +648,20 @@ async def worker(state: State) -> Dict[str, Any]:
         )
 
     system_message = "\n\n".join(sections)
-    messages = sanitize_tool_call_history(state["messages"])
+    sanitized = sanitize_tool_call_history(state["messages"])
 
-    # Inject / replace system message
-    found = False
-    for msg in messages:
+    # Build the final message list for the LLM: Always one fresh system prompt at the top.
+    final_messages = [{"role": "system", "content": system_message}]
+    for msg in sanitized:
         is_sys = (
             getattr(msg, "type", "") == "system"
             or (isinstance(msg, dict) and msg.get("type") == "system")
         )
-        if is_sys:
-            if hasattr(msg, "content"):
-                msg.content = system_message
-            else:
-                msg["content"] = system_message
-            found = True
-            break
-
-    if not found:
-        messages = [{"role": "system", "content": system_message}] + messages
+        if not is_sys:
+            final_messages.append(msg)
 
     log.debug("worker() — invoking LLM...")
-    response = await worker_llm_with_tools.ainvoke(messages)
+    response = await worker_llm_with_tools.ainvoke(final_messages)
     log.debug("worker() — LLM done.")
     return {"messages": [response]}
 
@@ -762,6 +861,13 @@ async def upload_files(
             )
             continue
 
+        # 1b) Enforce allowlist so unsupported binary/unknown types are rejected.
+        if suffix not in ALLOWED_EXTENSIONS:
+            ignored_files.append(
+                {"filename": filename, "reason": f"unsupported file type: {suffix or '[no extension]'}"}
+            )
+            continue
+
         # 2) Extract text by file type.
         text = ""
         try:
@@ -917,7 +1023,11 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                                 yield {"event": "status", "data": json.dumps({"text": status})}
                         else:
                             yield {"event": "status", "data": json.dumps({"text": "🧠 Thinking..."})}
-                            txt = content_to_text(getattr(last_msg, "content", None))
+                            txt = content_to_text(
+                                last_msg.get("content", "")
+                                if isinstance(last_msg, dict)
+                                else getattr(last_msg, "content", None)
+                            )
                             if txt and not txt.startswith("Evaluator Feedback:"):
                                 formatted = format_assistant_markdown(txt)
                                 latest_assistant_text = formatted
