@@ -868,6 +868,13 @@ async def serve_app_js() -> FileResponse:
     )
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+@app.get("/favicon.png", include_in_schema=False)
+async def favicon_placeholder() -> Response:
+    """Avoid 500s when browsers probe /favicon.* (no asset shipped by default)."""
+    return Response(status_code=204)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_index() -> HTMLResponse:
     with open(PUBLIC_DIR / "index.html", encoding="utf-8") as f:
