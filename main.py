@@ -40,7 +40,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from langchain.tools import tool
@@ -848,36 +848,41 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────── FastAPI App ─────────────────────────────────
 
 app = FastAPI(title="Sidekick AI", lifespan=lifespan)
-app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
+
+# Vercel bundles only what includeFiles lists; missing `public/` must not crash import.
+if PUBLIC_DIR.is_dir():
+    app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
+else:
+    log.warning(
+        "PUBLIC_DIR does not exist (%s) — skipping /public mount. "
+        "Set vercel.json functions.api/index.py.includeFiles.",
+        PUBLIC_DIR,
+    )
 
 
 @app.get("/styles.css", include_in_schema=False)
 async def serve_styles_css() -> FileResponse:
-    """Root path: matches Vercel `public/` CDN layout and catch-all rewrites."""
-    return FileResponse(
-        PUBLIC_DIR / "styles.css",
-        media_type="text/css; charset=utf-8",
-    )
+    """Root path: matches Vercel `public/` CDN layout and narrow rewrites."""
+    path = PUBLIC_DIR / "styles.css"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="styles.css not deployed")
+    return FileResponse(path, media_type="text/css; charset=utf-8")
 
 
 @app.get("/app.js", include_in_schema=False)
 async def serve_app_js() -> FileResponse:
-    return FileResponse(
-        PUBLIC_DIR / "app.js",
-        media_type="application/javascript; charset=utf-8",
-    )
-
-
-@app.get("/favicon.ico", include_in_schema=False)
-@app.get("/favicon.png", include_in_schema=False)
-async def favicon_placeholder() -> Response:
-    """Avoid 500s when browsers probe /favicon.* (no asset shipped by default)."""
-    return Response(status_code=204)
+    path = PUBLIC_DIR / "app.js"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="app.js not deployed")
+    return FileResponse(path, media_type="application/javascript; charset=utf-8")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index() -> HTMLResponse:
-    with open(PUBLIC_DIR / "index.html", encoding="utf-8") as f:
+    path = PUBLIC_DIR / "index.html"
+    if not path.is_file():
+        raise HTTPException(status_code=503, detail="index.html not deployed with function bundle")
+    with open(path, encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 
