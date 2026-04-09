@@ -80,9 +80,15 @@ DEFAULT_SUCCESS_CRITERIA = (
     "Provide a helpful, accurate response to the user's latest request. "
     "Ask a clarifying question only if required details are missing."
 )
+BASE_DIR = Path(__file__).resolve().parent
+PUBLIC_DIR = BASE_DIR / "public"
 
 # Local persistence (RAG chunks + LangGraph checkpoints). Survives process restarts.
-DATA_DIR = Path(__file__).resolve().parent / ".sidekick_data"
+if os.getenv("VERCEL") == "1":
+    # Vercel serverless filesystem is writable only under /tmp.
+    DATA_DIR = Path("/tmp/.sidekick_data")
+else:
+    DATA_DIR = BASE_DIR / ".sidekick_data"
 RAG_DB_PATH = DATA_DIR / "rag.sqlite"
 CHECKPOINT_DB_PATH = DATA_DIR / "checkpoints.sqlite"
 
@@ -822,12 +828,12 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────── FastAPI App ─────────────────────────────────
 
 app = FastAPI(title="Sidekick AI", lifespan=lifespan)
-app.mount("/public", StaticFiles(directory="public"), name="public")
+app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index() -> HTMLResponse:
-    with open("public/index.html", encoding="utf-8") as f:
+    with open(PUBLIC_DIR / "index.html", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 
