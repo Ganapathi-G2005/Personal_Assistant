@@ -328,14 +328,6 @@ async function sendMessage() {
   const criteria = criteriaInput.value.trim();
 
   if (!message || state.isProcessing) return;
-  if (!criteria) {
-    criteriaInput.focus();
-    criteriaInput.style.borderColor = "var(--btn-danger-text)";
-    setTimeout(() => (criteriaInput.style.borderColor = ""), 1500);
-    setStatus("⚠️ Please provide success criteria.", true);
-    setTimeout(clearStatus, 2000);
-    return;
-  }
 
   // UI Lock
   state.isProcessing = true;
@@ -357,7 +349,7 @@ async function sendMessage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message,
-        success_criteria: criteria,
+        success_criteria: criteria || null,
         thread_id: state.threadId,
       }),
     });

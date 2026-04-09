@@ -76,6 +76,10 @@ CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
 RAG_TOP_K = 4
 MAX_CHUNKS_PER_SOURCE = 2
+DEFAULT_SUCCESS_CRITERIA = (
+    "Provide a helpful, accurate response to the user's latest request. "
+    "Ask a clarifying question only if required details are missing."
+)
 
 # Local persistence (RAG chunks + LangGraph checkpoints). Survives process restarts.
 DATA_DIR = Path(__file__).resolve().parent / ".sidekick_data"
@@ -189,7 +193,7 @@ class EvaluatorOutput(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    success_criteria: str
+    success_criteria: Optional[str] = None
     thread_id: Optional[str] = None
 
 
@@ -952,6 +956,7 @@ async def upload_files(
 @app.post("/api/chat")
 async def chat_stream(request: ChatRequest) -> EventSourceResponse:
     thread_id = request.thread_id or str(uuid.uuid4())
+    resolved_success_criteria = (request.success_criteria or "").strip() or DEFAULT_SUCCESS_CRITERIA
 
     async def event_generator() -> AsyncGenerator[Dict[str, str], None]:
 
@@ -984,7 +989,7 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
 
         base_input: Dict[str, Any] = {
             "messages": [{"role": "user", "content": request.message}],
-            "success_criteria": request.success_criteria,
+            "success_criteria": resolved_success_criteria,
             "rag_context": rag_context,
             "feedback_on_work": None,
             "success_criteria_met": False,

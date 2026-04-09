@@ -10,7 +10,7 @@
     />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="stylesheet" href="/public/styles.css" />
+    <link rel="stylesheet" href="/public/styles.css?v=20260408a" />
   </head>
   <body>
     <div class="app-container">
@@ -19,8 +19,8 @@
         <div class="header-brand">
           <div class="header-logo">⚡</div>
           <div>
-            <div class="header-title">Sidekick</div>
-            <div class="header-subtitle">Personal AI Co-Worker</div>
+            <div class="header-title">Personal Assistant</div>
+            <div class="header-subtitle">Your mini AI Co-Worker</div>
           </div>
         </div>
         <div class="header-controls">
@@ -49,9 +49,8 @@
           <div class="empty-icon">🤖</div>
           <div class="empty-title">How can I help you today?</div>
           <div class="empty-desc">
-            Type your request below and define your success criteria. I'll
-            search the web, browse pages, and keep working until your goal is
-            met.
+            Type your request below. Success criteria is optional, and I'll
+            still respond normally if you leave it empty.
           </div>
         </div>
       </main>
@@ -69,12 +68,12 @@
         </div>
         <div class="input-group">
           <label class="input-label" for="criteriaInput"
-            >Success Criteria</label
+            >Success Criteria (optional)</label
           >
           <textarea
             id="criteriaInput"
             rows="1"
-            placeholder="e.g. Provide titles, sources, and a 2-sentence summary for each article."
+            placeholder="Optional: e.g. Provide titles, sources, and a 2-sentence summary for each article."
             aria-label="Describe what a successful response looks like"
           ></textarea>
         </div>
@@ -110,6 +109,6 @@
       </footer>
     </div>
 
-    <script src="/public/app.js"></script>
+    <script src="/public/app.js?v=20260408a"></script>
   </body>
 </html>
