@@ -44,13 +44,11 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from langchain.tools import tool
-from langchain_community.agent_toolkits import PlayWrightBrowserToolkit
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from playwright.async_api import async_playwright
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from tavily import TavilyClient
@@ -83,12 +81,19 @@ DEFAULT_SUCCESS_CRITERIA = (
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
 
+
+def _is_serverless() -> bool:
+    """Vercel / AWS Lambda: read-only filesystem except /tmp; no browser automation."""
+    return (
+        os.getenv("VERCEL") == "1"
+        or os.getenv("VERCEL_ENV") is not None
+        or os.getenv("AWS_LAMBDA_FUNCTION_NAME") is not None
+    )
+
+
 # Local persistence (RAG chunks + LangGraph checkpoints). Survives process restarts.
-if os.getenv("VERCEL") == "1":
-    # Vercel serverless filesystem is writable only under /tmp.
-    DATA_DIR = Path("/tmp/.sidekick_data")
-else:
-    DATA_DIR = BASE_DIR / ".sidekick_data"
+# Serverless: only /tmp is writable — required or SQLite/checkpoints crash at startup.
+DATA_DIR = Path("/tmp/.sidekick_data") if _is_serverless() else (BASE_DIR / ".sidekick_data")
 RAG_DB_PATH = DATA_DIR / "rag.sqlite"
 CHECKPOINT_DB_PATH = DATA_DIR / "checkpoints.sqlite"
 
@@ -782,26 +787,34 @@ async def lifespan(app: FastAPI):
     init_rag_db()
     load_rag_from_disk()
 
-    log.info("Launching Playwright browser...")
-    try:
-        _playwright_context = await async_playwright().start()
-        async_browser = await asyncio.wait_for(
-            _playwright_context.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            ),
-            timeout=PLAYWRIGHT_TIMEOUT,
-        )
-        toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=async_browser)
-        pw_tools = toolkit.get_tools()
-        tools = pw_tools + [tavily_search]
-        log.info("Playwright ready. Tools: %s", [t.name for t in tools])
-    except Exception:
-        log.exception(
-            "Playwright failed — falling back to tavily_search only. "
-            "Browser-based tools will be unavailable this session."
-        )
+    if _is_serverless():
+        # Playwright/Chromium is not viable on Vercel serverless (size, deps, no display).
+        log.info("Serverless: skipping Playwright; using tavily_search only.")
         tools = [tavily_search]
+    else:
+        log.info("Launching Playwright browser...")
+        try:
+            from langchain_community.agent_toolkits import PlayWrightBrowserToolkit
+            from playwright.async_api import async_playwright
+
+            _playwright_context = await async_playwright().start()
+            async_browser = await asyncio.wait_for(
+                _playwright_context.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                ),
+                timeout=PLAYWRIGHT_TIMEOUT,
+            )
+            toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=async_browser)
+            pw_tools = toolkit.get_tools()
+            tools = pw_tools + [tavily_search]
+            log.info("Playwright ready. Tools: %s", [t.name for t in tools])
+        except Exception:
+            log.exception(
+                "Playwright failed — falling back to tavily_search only. "
+                "Browser-based tools will be unavailable this session."
+            )
+            tools = [tavily_search]
 
     worker_llm_with_tools = worker_llm.bind_tools(tools)
 
