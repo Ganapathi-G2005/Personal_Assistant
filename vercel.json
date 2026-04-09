@@ -18,7 +18,7 @@
     "api/index.py": {
       "memory": 2048,
       "maxDuration": 60,
-      "includeFiles": "{main.py,public/index.html,public/styles.css,public/app.js}"
+      "includeFiles": "{main.py,public/index.html,public/styles.css,public/app.js,public/logo.svg}"
     }
   }
 }

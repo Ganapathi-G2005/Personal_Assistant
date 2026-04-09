@@ -877,6 +877,14 @@ async def serve_app_js() -> FileResponse:
     return FileResponse(path, media_type="application/javascript; charset=utf-8")
 
 
+@app.get("/logo.svg", include_in_schema=False)
+async def serve_logo_svg() -> FileResponse:
+    path = PUBLIC_DIR / "logo.svg"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="logo.svg not found")
+    return FileResponse(path, media_type="image/svg+xml; charset=utf-8")
+
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_index() -> HTMLResponse:
     path = PUBLIC_DIR / "index.html"

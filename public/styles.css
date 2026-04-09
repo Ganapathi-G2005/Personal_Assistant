@@ -259,36 +259,23 @@ body::before {
 }
 
 .header-logo {
-  width: 38px;
-  height: 38px;
-  background: var(--accent-gradient);
-  background-size: 200% 200%;
-  animation: borderRotate 6s ease infinite;
+  width: 40px;
+  height: 40px;
   border-radius: var(--radius-sm);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 17px;
   flex-shrink: 0;
-  position: relative;
   overflow: hidden;
-}
-
-.header-logo::after {
-  content: "";
-  position: absolute;
-  inset: 1px;
-  background: var(--bg-surface);
-  border-radius: calc(var(--radius-sm) - 1px);
   display: flex;
   align-items: center;
   justify-content: center;
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
 }
 
-/* Make the emoji sit on top of the overlay */
-.header-logo > * {
-  position: relative;
-  z-index: 1;
+.header-logo-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
 }
 
 .header-title {
