@@ -41,7 +41,7 @@ if sys.platform == "win32":
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
@@ -842,6 +842,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Sidekick AI", lifespan=lifespan)
 app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
+
+
+@app.get("/styles.css", include_in_schema=False)
+async def serve_styles_css() -> FileResponse:
+    """Root path: matches Vercel `public/` CDN layout and catch-all rewrites."""
+    return FileResponse(
+        PUBLIC_DIR / "styles.css",
+        media_type="text/css; charset=utf-8",
+    )
+
+
+@app.get("/app.js", include_in_schema=False)
+async def serve_app_js() -> FileResponse:
+    return FileResponse(
+        PUBLIC_DIR / "app.js",
+        media_type="application/javascript; charset=utf-8",
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
