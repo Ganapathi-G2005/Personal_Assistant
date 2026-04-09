@@ -41,7 +41,7 @@ if sys.platform == "win32":
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
@@ -89,6 +89,13 @@ def _is_serverless() -> bool:
         or os.getenv("VERCEL_ENV") is not None
         or os.getenv("AWS_LAMBDA_FUNCTION_NAME") is not None
     )
+
+
+def _format_sse_event(item: Dict[str, str]) -> str:
+    """One Server-Sent Events block (event types match sse-starlette / frontend parser)."""
+    ev = item.get("event", "message")
+    da = item.get("data", "")
+    return f"event: {ev}\ndata: {da}\n\n"
 
 
 # Local persistence (RAG chunks + LangGraph checkpoints). Survives process restarts.
@@ -990,11 +997,11 @@ async def upload_files(
 
 
 @app.post("/api/chat")
-async def chat_stream(request: ChatRequest) -> EventSourceResponse:
+async def chat_stream(request: ChatRequest):
     thread_id = request.thread_id or str(uuid.uuid4())
     resolved_success_criteria = (request.success_criteria or "").strip() or DEFAULT_SUCCESS_CRITERIA
 
-    async def event_generator() -> AsyncGenerator[Dict[str, str], None]:
+    async def chat_events() -> AsyncGenerator[Dict[str, str], None]:
 
         # ── 1. Immediate meta ─────────────────────────────────────────────────
         yield {"event": "meta", "data": json.dumps({"thread_id": thread_id})}
@@ -1004,6 +1011,24 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             yield {
                 "event": "error",
                 "data": json.dumps({"message": "Server not ready — please retry in a moment."}),
+            }
+            yield {
+                "event": "done",
+                "data": json.dumps({"assistant": "", "evaluator": "", "thread_id": thread_id}),
+            }
+            return
+
+        if not (os.getenv("OPENAI_API_KEY") or "").strip():
+            yield {
+                "event": "error",
+                "data": json.dumps(
+                    {
+                        "message": (
+                            "Missing OPENAI_API_KEY. Add it in your host's environment variables "
+                            "(e.g. Vercel Project → Settings → Environment Variables)."
+                        )
+                    }
+                ),
             }
             yield {
                 "event": "done",
@@ -1151,7 +1176,48 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             }),
         }
 
-    return EventSourceResponse(event_generator())
+    # Vercel/AWS: chunked SSE often fails with HTTP 500; buffer one full SSE body instead.
+    if _is_serverless():
+        parts: List[str] = []
+        try:
+            async for item in chat_events():
+                parts.append(_format_sse_event(item))
+        except Exception:
+            log.exception("chat_events failed while buffering for serverless")
+            parts.append(
+                _format_sse_event(
+                    {
+                        "event": "error",
+                        "data": json.dumps(
+                            {"message": "An internal error occurred. Check server logs."}
+                        ),
+                    }
+                )
+            )
+            parts.append(
+                _format_sse_event(
+                    {
+                        "event": "done",
+                        "data": json.dumps(
+                            {
+                                "assistant": "",
+                                "evaluator": "",
+                                "thread_id": thread_id,
+                            }
+                        ),
+                    }
+                )
+            )
+        return Response(
+            "".join(parts).encode("utf-8"),
+            media_type="text/event-stream; charset=utf-8",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    return EventSourceResponse(chat_events())
 
 
 # ─────────────────────────────── Reset ───────────────────────────────────────
