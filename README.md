@@ -1,260 +1,129 @@
 # Sidekick - Personal AI Assistant
 
-[![CI](https://github.com/yourusername/sidekick/workflows/CI/badge.svg)](https://github.com/yourusername/sidekick/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Formatting: human-curated](https://img.shields.io/badge/formatting-human--curated-7c6efc.svg)](#-development)
+Sidekick is a FastAPI + LangGraph personal assistant with a single-page web UI, streaming chat responses, optional web search tools, and per-thread file-aware context retrieval.
 
-A powerful personal AI assistant built with LangChain, featuring web search capabilities and deployable on Vercel. Sidekick uses a sophisticated agent architecture with evaluation loops to provide helpful, accurate responses.
+## Features
 
-## ✨ Features
+- LangGraph worker/evaluator loop with retry ceiling.
+- Streaming chat over Server-Sent Events (SSE).
+- File uploads with chunking and per-thread retrieval (RAG-style context injection).
+- Tavily web search tool integration.
+- Optional Playwright browser tools locally; graceful fallback when unavailable.
+- Thread persistence via SQLite checkpoints and document chunk storage.
+- Dark/light theme UI with conversation reset support.
 
-- **Intelligent Agent Architecture**: Built with LangChain and LangGraph for sophisticated reasoning
-- **Web Search Integration**: Powered by Tavily for real-time information retrieval
-- **Multiple Interfaces**: Web UI, Gradio interface, and REST API
-- **Vercel Ready**: Serverless deployment with FastAPI
-- **Conversation Memory**: Maintains context across interactions
-- **Success Criteria Evaluation**: Self-evaluating responses against user-defined criteria
-- **Modern UI**: Clean, responsive web interface with dark/light theme support
+## Architecture
 
-## 🚀 Quick Start
+- `main.py`: Main FastAPI app, graph lifecycle, tools, SSE chat stream, file upload, and reset endpoints.
+- `api/index.py`: Vercel serverless entrypoint that loads and exposes `app` from `main.py`.
+- `public/index.html`: Chat UI page.
+- `public/app.js`: Frontend chat/upload/reset logic and SSE event handling.
+- `public/styles.css`: Styling and theme rules.
+- `vercel.json`: Rewrites and function bundling config for deployment.
 
-### Prerequisites
+## Requirements
 
-- Python 3.10 or higher
-- OpenAI API key
-- (Optional) Tavily API key for web search
+- Python 3.13 recommended (the repository includes `.python-version` set to `3.13`).
+- Node.js + npm (for formatting/lint tooling only).
+- `OPENAI_API_KEY` (required for chat responses).
+- `TAVILY_API_KEY` (optional for Tavily search quality).
 
-### Installation
+## Local Setup
 
-1. **Clone the repository**
+### Python dependencies
 
-   ```bash
-   git clone https://github.com/yourusername/sidekick.git
-   cd sidekick
-   ```
-
-2. **Create a virtual environment**
-
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies**
-
-   ```bash
-   pip install -e ".[dev]"
-   ```
-
-4. **Set up environment variables**
-
-   ```bash
-   cp .env.example .env
-   # Edit .env with your API keys
-   ```
-
-5. **Run locally**
-
-   ```bash
-   # Start the API server
-   uvicorn api.chat:app --reload --port 8000
-
-   # Open public/index.html in your browser
-   ```
-
-## 📖 Usage
-
-### Web Interface
-
-1. Start the API server: `uvicorn api.chat:app --reload --port 8000`
-2. Open `public/index.html` in your browser
-3. Enter your message and success criteria
-4. Click "Go!" to get AI assistance
-
-### API Usage
+Use either `uv` or `pip`.
 
 ```bash
-curl -X POST http://localhost:8000/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "Help me plan a vacation to Japan",
-    "success_criteria": "Provide a detailed 7-day itinerary with recommendations"
-  }'
+# uv workflow (recommended if you use uv.lock)
+uv sync
+
+# or pip workflow
+pip install -r requirements.txt
 ```
 
-### Gradio Interface (Optional)
+### Frontend tooling dependencies
 
 ```bash
-python main.py
-```
-
-## 🏗️ Architecture
-
-Sidekick uses a sophisticated agent architecture:
-
-1. **Worker Agent**: Processes user requests and uses tools
-2. **Tool Integration**: Web search via Tavily
-3. **Evaluator**: Assesses responses against success criteria
-4. **Memory**: Maintains conversation context
-5. **Routing**: Intelligent flow control between components
-
-## 🛠️ Development
-
-### Setup Development Environment
-
-```bash
-# Install development dependencies
-pip install -e ".[dev]"
-
-# Install frontend formatting/lint tooling
 npm install
-
-# Run tests
-pytest
-
-# Format frontend/docs
-npm run format
-
-# Check formatting (CI-friendly)
-npm run format:check
-
-# Frontend lint (correctness-focused)
-npm run lint:js
-
-# Type checking
-mypy .
 ```
 
-### Formatting Standards
-
-- **Formatting guide:** See `FORMATTING.md` for project conventions.
-- **Philosophy:** readable, practical formatting over rigid formatter-only output.
-- **Markdown output:** AI responses are normalized to structured markdown (`##`, `**bold**`, `> warnings`, bullet lists).
-
-### Project Structure
-
-```
-sidekick/
-├── api/                    # FastAPI endpoints
-│   ├── chat.py            # Main chat API
-│   └── health.py          # Health check endpoint
-├── public/                # Static web interface
-│   ├── index.html         # Main UI
-│   ├── app.js            # Frontend JavaScript
-│   └── styles.css        # Styling
-├── main.py               # Gradio interface
-├── pyproject.toml        # Project configuration
-├── requirements.txt      # Production dependencies
-└── .github/workflows/    # CI/CD pipelines
-```
-
-## 🚀 Deployment
-
-### Vercel Deployment
-
-1. **Set up Vercel project**
-
-   ```bash
-   vercel
-   ```
-
-2. **Configure environment variables** in Vercel dashboard:
-   - `OPENAI_API_KEY`
-   - `TAVILY_API_KEY` (optional)
-   - `ENABLE_PLAYWRIGHT=false`
-
-3. **Deploy**
-   ```bash
-   vercel --prod
-   ```
-
-### Environment Variables
-
-| Variable            | Required | Description                               |
-| ------------------- | -------- | ----------------------------------------- |
-| `OPENAI_API_KEY`    | Yes      | OpenAI API key for GPT models             |
-| `TAVILY_API_KEY`    | No       | Tavily API key for web search             |
-| `ENABLE_PLAYWRIGHT` | No       | Enable Playwright tools (default: false)  |
-| `ENVIRONMENT`       | No       | Environment mode (development/production) |
-| `PORT`              | No       | API server port (default: 8000)           |
-
-## 🧪 Testing
+### Run the app
 
 ```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=sidekick --cov-report=html
-
-# Run specific test file
-pytest tests/test_chat.py
-
-# Run integration tests
-pytest -m integration
+uvicorn main:app --reload --port 8000
 ```
 
-## 📚 API Documentation
+Open [http://localhost:8000](http://localhost:8000).
 
-### Endpoints
+## Environment Variables
 
-#### `POST /api/chat`
+| Variable | Required | Description |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | Yes | API key used by `ChatOpenAI` models. |
+| `TAVILY_API_KEY` | No | API key for Tavily search tool. |
 
-Send a message to the AI assistant.
+Notes:
 
-**Request Body:**
+- In serverless environments (`VERCEL`, `VERCEL_ENV`, or Lambda vars), Sidekick switches to serverless-safe behavior.
+- Playwright tools are attempted only in non-serverless mode and may fall back to Tavily-only automatically if browser startup fails.
+
+## API Endpoints
+
+- `GET /`: Serves the chat UI.
+- `GET /styles.css`: Serves frontend styles.
+- `GET /app.js`: Serves frontend script.
+- `GET /logo.svg`: Serves logo asset.
+- `POST /api/upload`: Upload and index files for a thread.
+- `POST /api/chat`: Stream assistant output over SSE (`meta`, `status`, `assistant`, `error`, `done` events).
+- `POST /api/reset`: Returns a new `thread_id`; optionally accepts an old `thread_id` query param for cleanup.
+
+### `POST /api/chat` request body
 
 ```json
 {
   "message": "string",
-  "success_criteria": "string",
+  "success_criteria": "string (optional)",
   "thread_id": "string (optional)"
 }
 ```
 
-**Response:**
+### `POST /api/upload` behavior
 
-```json
-{
-  "thread_id": "string",
-  "assistant": "string",
-  "evaluator": "string"
-}
+- Accepted extensions include text/code/docs such as `.txt`, `.md`, `.py`, `.json`, `.csv`, `.html`, `.js`, `.ts`, `.css`, `.log`, `.pdf`, and `.docx`.
+- Files over 5 MB are ignored.
+- Indexed chunks are stored per thread in SQLite and reused across turns.
+
+## Deployment (Vercel)
+
+The repository includes `vercel.json` rewrites that route `/` and `/api/*` to `api/index.py`.
+
+```bash
+vercel
+vercel --prod
 ```
 
-#### `GET /api/health`
+Set environment variables in Vercel:
 
-Health check endpoint.
+- `OPENAI_API_KEY` (required)
+- `TAVILY_API_KEY` (optional)
 
-**Response:**
+## Developer Commands
 
-```json
-{
-  "status": "ok"
-}
+```bash
+# Format frontend/docs
+npm run format
+
+# Check formatting
+npm run format:check
+
+# Lint frontend JavaScript
+npm run lint:js
 ```
 
-## 🤝 Contributing
+See `FORMATTING.md` for formatting conventions.
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+## Current Gaps
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [LangChain](https://github.com/langchain-ai/langchain) for the agent framework
-- [OpenAI](https://openai.com/) for the language models
-- [Tavily](https://tavily.com/) for web search capabilities
-- [Vercel](https://vercel.com/) for serverless deployment
-- [FastAPI](https://fastapi.tiangolo.com/) for the API framework
-
-Made with ❤️ by GMS Ganapathi.
+- There is no committed automated test suite in this repository yet.
+- `.docx` parsing expects `python-docx`; if not installed, `.docx` files are reported as ignored during upload.
