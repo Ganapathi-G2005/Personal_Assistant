@@ -509,6 +509,16 @@ tools: List[Any] = []
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY", ""))
 
 
+def get_groq_chat_kwargs() -> Dict[str, Any]:
+    """Build LangChain ChatOpenAI kwargs for Groq's OpenAI-compatible endpoint."""
+    return {
+        "api_key": (os.getenv("GROQ_API_KEY") or "").strip(),
+        "base_url": (os.getenv("GROQ_BASE_URL") or "https://api.groq.com/openai/v1").strip(),
+        "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+        "temperature": 0,
+    }
+
+
 @tool
 def tavily_search(query: str) -> str:
     """Search the web for up-to-date information using Tavily."""
@@ -518,10 +528,10 @@ def tavily_search(query: str) -> str:
 
 # ─────────────────────────────── LLMs ────────────────────────────────────────
 
-worker_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+worker_llm = ChatOpenAI(**get_groq_chat_kwargs())
 worker_llm_with_tools: Optional[Any] = None  # bound post Playwright init
 
-evaluator_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+evaluator_llm = ChatOpenAI(**get_groq_chat_kwargs())
 evaluator_llm_with_output = evaluator_llm.with_structured_output(EvaluatorOutput)
 
 
@@ -1038,13 +1048,13 @@ async def chat_stream(request: ChatRequest):
             }
             return
 
-        if not (os.getenv("OPENAI_API_KEY") or "").strip():
+        if not (os.getenv("GROQ_API_KEY") or "").strip():
             yield {
                 "event": "error",
                 "data": json.dumps(
                     {
                         "message": (
-                            "Missing OPENAI_API_KEY. Add it in your host's environment variables "
+                            "Missing GROQ_API_KEY. Add it in your host's environment variables "
                             "(e.g. Vercel Project → Settings → Environment Variables)."
                         )
                     }

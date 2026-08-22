@@ -25,7 +25,7 @@ Sidekick is a FastAPI + LangGraph personal assistant with a single-page web UI, 
 
 - Python 3.13 recommended (the repository includes `.python-version` set to `3.13`).
 - Node.js + npm (for formatting/lint tooling only).
-- `OPENAI_API_KEY` (required for chat responses).
+- `GROQ_API_KEY` (required for Groq chat responses).
 - `TAVILY_API_KEY` (optional for Tavily search quality).
 
 ## Local Setup
@@ -60,7 +60,9 @@ Open [http://localhost:8000](http://localhost:8000).
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | Yes | API key used by `ChatOpenAI` models. |
+| `GROQ_API_KEY` | Yes | Groq API key used by the Groq OpenAI-compatible endpoint. |
+| `GROQ_BASE_URL` | No | Optional override for the Groq base URL (defaults to `https://api.groq.com/openai/v1`). |
+| `GROQ_MODEL` | No | Optional model override (defaults to `openai/gpt-oss-120b`). |
 | `TAVILY_API_KEY` | No | API key for Tavily search tool. |
 
 Notes:
@@ -105,7 +107,9 @@ vercel --prod
 
 Set environment variables in Vercel:
 
-- `OPENAI_API_KEY` (required)
+- `GROQ_API_KEY` (required)
+- `GROQ_BASE_URL` (optional; defaults to `https://api.groq.com/openai/v1`)
+- `GROQ_MODEL` (optional; defaults to `openai/gpt-oss-120b`)
 - `TAVILY_API_KEY` (optional)
 
 ## Developer Commands
